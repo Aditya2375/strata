@@ -742,4 +742,90 @@ out=$(timeout 10 sh -c "printf 'ls\ndump\n' | $BIN shell $img 2>&1"); rc=$?
 $BIN fsck $img --fix >/dev/null 2>&1
 $BIN fsck $img 2>&1 | grep -q clean && echo "ok: unterminated name repaired, converges" || { echo "FAIL: F6 fsck"; fails=1; }
 
+
+echo "--- round-5 regressions ---"
+
+# R5-1: a directory size that is not a multiple of 128 is corruption in
+# every scan, not a phantom entry: ls, rmdir and lookup all agree
+img=$T/r5s1.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'write /a/f data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R5PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+set_size(d,g,aino,129)
+d.close()
+R5PY
+out=$(printf 'ls /a\nrmdir /a\ncat /a/f\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"filesystem corrupted"*"filesystem corrupted"*"filesystem corrupted"*) echo "ok: partial trailing dir slot rejected everywhere";;
+  *) echo "FAIL: R5-1 [$out]"; fails=1;;
+esac
+$BIN fsck $img --fix >/dev/null 2>&1
+$BIN fsck $img 2>&1 | grep -q clean && echo "ok: size-129 dir repaired, converges" || { echo "FAIL: R5-1 fsck"; fails=1; }
+
+# R5-2: dump skips dangling entries instead of printing a fabricated record
+img=$T/r5s2.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'write /b more' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R5PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'b')
+d.seek(pb*BS+off); d.write(s.pack('<I',100))   # ino 100 is free
+d.close()
+R5PY
+out=$(printf 'dump\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"dangling entry, skipped"*"F /a "*) echo "ok: dump flags dangling entries, keeps real files";;
+  *) echo "FAIL: R5-2 [$out]"; fails=1;;
+esac
+
+# R5-3: a FILE-typed dentry pointing at a live directory is EISDIR from the
+# inode, and the subtree survives
+img=$T/r5s3.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'write /a/f data' 'write /evil x' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R5PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+pb,off,e=find(d,g,g['root'],'evil')
+de=bytearray(e); de[0:4]=s.pack('<I',aino); de[4]=2   # FILE-typed, points at the dir
+d.seek(pb*BS+off); d.write(bytes(de))
+d.close()
+R5PY
+out=$(printf 'rm /evil\ncat /a/f\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"is a directory"*"data"*) echo "ok: rm refuses FILE-dentry to live dir, subtree intact";;
+  *) echo "FAIL: R5-3 [$out]"; fails=1;;
+esac
+
+# R5-5: duplicate block ownership: the REACHABLE owner keeps the data even
+# when the other claimant has the lower inode number
+img=$T/r5s5.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /live precious-data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R5PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'live'); lino=s.unpack_from('<I',e,0)[0]
+d.seek(g['it']*BS+lino*128); ino=d.read(128); blk=s.unpack_from('<I',ino,36)[0]
+d.seek(g['it']*BS+50*128); d.write(ino)          # move /live to inode 50
+d.seek(pb*BS+off); d.write(s.pack('<I',50)+e[4:])
+c=bytearray(128); c[0:2]=bytes([2,0]); c[12:16]=s.pack('<I',1)
+s.pack_into('<Q',c,16,13); s.pack_into('<I',c,32,1); s.pack_into('<I',c,36,blk)
+d.seek(g['it']*BS+2*128); d.write(bytes(c))      # orphan inode 2 (lower) claims the block
+d.seek(g['ibm']*BS); bm=bytearray(d.read(BS)); bm[50//8]|=(1<<(50%8))
+d.seek(g['ibm']*BS); d.write(bm)
+d.close()
+R5PY
+out=$($BIN fsck $img --fix 2>&1)
+case "$out" in
+  *"unreachable owner's pointer zeroed"*) : ;;
+  *) echo "FAIL: R5-5 [$out]"; fails=1;;
+esac
+$BIN fsck $img 2>&1 | grep -q clean && n=$(printf 'cat /live\n' | $BIN shell $img 2>/dev/null) && [ "$n" = "precious-data" ]   && echo "ok: reachable owner keeps the block, fsck converges" || { echo "FAIL: R5-5 data [$n]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

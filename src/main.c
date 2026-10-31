@@ -85,7 +85,8 @@ static int cmd_ls(char *arg){
         return 0;
     }
     struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
-    if(fs_readdir(&F,ino,ents,4096,&cnt,&trunc)){ free(ents); printf("ls: read error\n"); return 1; }
+    int rr=fs_readdir(&F,ino,ents,4096,&cnt,&trunc);
+    if(rr){ free(ents); printf("ls: %s: %s\n",path?path:".",ename(-rr)); return 1; }
     if(trunc) printf("ls: (listing truncated at %u entries)\n",cnt);
     /* sort by name for stable output */
     for(uint32_t i=1;i<cnt;i++){
@@ -156,7 +157,11 @@ static int one_cmd(char *line){
                     else if(top<510){ strcpy(stack[++top],p); istack[top]=ents[i].ino; if(dseen&&ents[i].ino<F.sb.ninodes) dseen[ents[i].ino]=1; }
                     else fprintf(stderr,"dump: %s: tree too deep, subtree skipped\n",p);
                 } else {
-                    struct fs_stat st; fs_stat(&F,ents[i].ino,&st);
+                    struct fs_stat st;
+                    if(fs_stat(&F,ents[i].ino,&st)){
+                        fprintf(stderr,"dump: %s: dangling entry, skipped\n",p);
+                        continue;
+                    }
                     uint64_t h=1469598103934665603ULL;
                     char buf[STRATA_BS]; uint64_t off=0,got;
                     while(fs_read(&F,ents[i].ino,off,buf,sizeof buf,&got)==0&&got){

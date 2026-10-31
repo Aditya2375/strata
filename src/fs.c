@@ -502,10 +502,16 @@ int fs_unlink(struct fs *f, uint32_t cwd, const char *path){
     if(r||!last[0]||par==UINT32_MAX) return r?r:-ENOENT;
     struct dinode pd; fs_iget(f,par,&pd);
     struct dentry de;
+    r=dir_scan(f,&pd,par,last,NULL,&de);
+    if(r) return r;
+    struct dinode d; fs_iget(f,de.ino,&d);
+    /* decide from the inode, not the dentry: a FILE-typed entry pointing
+       at a live directory must not unlink the entry and orphan the whole
+       subtree (cd and stat already judge by the inode) */
+    if(d.type==T_DIR) return -EISDIR;
+    if(d.type==T_FREE) return -ENOENT; /* dangling entry: like stat */
     r=dir_remove(f,&pd,par,last,&de);
     if(r) return r;
-    if(de.type==T_DIR){ dir_add(f,&pd,par,last,de.ino,de.type); return -EISDIR; }
-    struct dinode d; fs_iget(f,de.ino,&d);
     if(--d.nlink==0){ free_blocks(f,&d,0); ifree(f,de.ino); }
     else fs_iput(f,de.ino,&d);
     return 0;
@@ -522,6 +528,8 @@ int fs_rmdir(struct fs *f, uint32_t cwd, const char *path){
     if(de.ino==f->sb.lnf_ino) return -EPERM; /* /lost+found is fsck's */
     if(de.type!=T_DIR) return -ENOTDIR;
     struct dinode d; fs_iget(f,de.ino,&d);
+    if(d.type!=T_DIR) return -ENOTDIR; /* trust the inode over the dentry */
+    if(d.size%128) return -EFSCORRUPT;
     for(uint64_t off=0; off<d.size; off+=128){
         int err; uint32_t pb=bmap(f,&d,de.ino,(uint32_t)(off/STRATA_BS),0,&err);
         if(!pb) return -EFSCORRUPT;
@@ -608,6 +616,7 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
         if(sd.type==T_DIR && de.type!=T_DIR) return -ENOTDIR;
         if(de.type==T_DIR){
             struct dinode dd; fs_iget(f,de.ino,&dd);
+            if(dd.size%128) return -EFSCORRUPT;
             for(uint64_t off=0; off<dd.size; off+=128){
                 int err; uint32_t pb=bmap(f,&dd,de.ino,(uint32_t)(off/STRATA_BS),0,&err);
                 if(!pb) return -EFSCORRUPT;
@@ -667,6 +676,9 @@ int fs_stat(struct fs *f, uint32_t ino, struct fs_stat *st){
 int fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uint32_t *count, int *truncated){
     struct dinode d; fs_iget(f,ino,&d);
     if(d.type!=T_DIR) return -ENOTDIR;
+    /* a partial trailing slot is corruption, not an entry: reading it
+       would invent a phantom name ls can see but lookup cannot */
+    if(d.size%128) return -EFSCORRUPT;
     if(truncated) *truncated=0;
     uint32_t n=0;
     uint64_t off=0;

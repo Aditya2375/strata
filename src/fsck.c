@@ -18,6 +18,8 @@ typedef struct {
     uint8_t *reach;                 /* reachable from root */
     uint32_t *owner;                /* first inode claiming each data block */
     uint8_t *dir_seen;              /* a directory inode already has a dentry */
+    struct conflict *conf;          /* duplicate block claims, resolved after the walk */
+    size_t nconf, capconf;
 } ck;
 
 static uint32_t cg32(const uint8_t *p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
@@ -72,18 +74,54 @@ static void claim_blk(ck *c, uint32_t ino, uint32_t b){
 static int dup_blk(ck *c, uint32_t b){
     return c->owner[b]!=UINT32_MAX; /* any prior owner conflicts */
 }
+/* duplicate claims are logged, not repaired in pass 1: who keeps the block
+ * is decided once the directory walk says which owner is reachable */
+struct conflict { uint32_t ino, blk; };
+static void log_conflict(ck *c, uint32_t ino, uint32_t b){
+    if(c->nconf==c->capconf){
+        size_t nc=c->capconf?c->capconf*2:32;
+        struct conflict *nl=realloc(c->conf,nc*sizeof *nl);
+        if(!nl){ fprintf(c->log,"fsck: FATAL: out of memory logging duplicate blocks\n"); c->errors++; return; }
+        c->conf=nl; c->capconf=nc;
+    }
+    c->conf[c->nconf].ino=ino; c->conf[c->nconf].blk=b; c->nconf++;
+}
+/* zero every pointer of ino that references b (direct slots, the indirect
+ * pointer, or entries inside its indirect table) */
+static void zero_block_refs(ck *c, uint32_t ino, uint32_t b){
+    struct dinode d; idata(c,ino,&d);
+    int chg=0;
+    for(int i=0;i<STRATA_NDIRECT;i++)
+        if(d.direct[i]==b){ d.direct[i]=0; d.blocks--; chg=1; }
+    if(d.indirect==b){ d.indirect=0; d.blocks--; chg=1; }
+    else if(d.indirect && okblk(c,d.indirect)){
+        uint32_t *tab=(uint32_t*)cblk(c,d.indirect);
+        int tchg=0;
+        for(uint32_t i=0;i<STRATA_BS/4;i++)
+            if(tab[i]==b){ tab[i]=0; d.blocks--; tchg=1; }
+        if(tchg){ cwrite(c,d.indirect); chg=1; }
+    }
+    if(chg) iputd(c,ino,&d);
+}
 static void mark_ino_blocks(ck *c, uint32_t ino, struct dinode *d){
     for(int i=0;i<STRATA_NDIRECT;i++){
         uint32_t b=d->direct[i];
         if(!b) continue;
         if(!okblk(c,b)){ report(c,1,"bad direct pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); continue; }
-        if(dup_blk(c,b)){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); continue; }
+        if(dup_blk(c,b)){
+            if(c->owner[b]==ino){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); }
+            else log_conflict(c,ino,b);
+            continue;
+        }
         claim_blk(c,ino,b);
     }
     uint32_t ib=d->indirect;
     if(ib){
         if(!okblk(c,ib)){ report(c,1,"bad indirect pointer zeroed",ino,ib); d->indirect=0; d->blocks--; iputd(c,ino,d); }
-        else if(dup_blk(c,ib)){ report(c,1,"duplicate block ownership: duplicate indirect zeroed",ino,ib); d->indirect=0; d->blocks--; iputd(c,ino,d); }
+        else if(dup_blk(c,ib)){
+            if(c->owner[ib]==ino){ report(c,1,"duplicate block ownership: duplicate indirect zeroed",ino,ib); d->indirect=0; d->blocks--; iputd(c,ino,d); }
+            else log_conflict(c,ino,ib);
+        }
         else{
             claim_blk(c,ino,ib);
             uint32_t *tab=(uint32_t*)cblk(c,ib);
@@ -92,7 +130,11 @@ static void mark_ino_blocks(ck *c, uint32_t ino, struct dinode *d){
                 uint32_t b=tab[i];
                 if(!b) continue;
                 if(!okblk(c,b)){ report(c,1,"bad indirect entry zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; continue; }
-                if(dup_blk(c,b)){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; continue; }
+                if(dup_blk(c,b)){
+            if(c->owner[b]==ino){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); }
+            else log_conflict(c,ino,b);
+            continue;
+        }
                 claim_blk(c,ino,b);
             }
             if(chg){ cwrite(c,ib); iputd(c,ino,d); }
@@ -434,7 +476,7 @@ int fsck(const char *path, int fix, FILE *log){
     }
 
     /* pass 2: reachability from root */
-    if(c.sb.root_ino>=c.sb.ninodes){ fprintf(log,"fsck: FATAL: root inode out of range\n"); goto out; }
+    if(c.sb.root_ino>=c.sb.ninodes){ fprintf(log,"fsck: FATAL: root inode out of range\n"); c.errors++; goto out; }
     { struct dinode rd; idata(&c,c.sb.root_ino,&rd);
       if(rd.type!=T_DIR){
         fprintf(log,"fsck: FATAL: root inode is not a directory, image needs manual repair\n");
@@ -458,6 +500,26 @@ int fsck(const char *path, int fix, FILE *log){
           if(nl==UINT32_MAX){ fprintf(log,"fsck: FATAL: could not recreate /lost+found\n"); c.errors++; }
         }
       } }
+
+    /* resolve duplicate block ownership now that reachability is known:
+     * a reachable owner keeps its data; an unreachable one loses the
+     * pointer. With no reachable owner (or a tie), the first claimant -
+     * the lower inode number - keeps it, as before. */
+    for(size_t i=0;i<c.nconf;i++){
+        uint32_t b=c.conf[i].blk, second=c.conf[i].ino;
+        uint32_t first=c.owner[b];
+        if(first==UINT32_MAX) continue;           /* already re-seated */
+        int first_ok=first<c.sb.ninodes && c.reach[first];
+        int second_ok=second<c.sb.ninodes && c.reach[second];
+        if(second_ok && !first_ok){
+            zero_block_refs(&c,first,b);
+            report(&c,1,"duplicate block ownership: unreachable owner's pointer zeroed",first,b);
+            c.owner[b]=second;
+        }else{
+            zero_block_refs(&c,second,b);
+            report(&c,1,"duplicate block ownership: duplicate pointer zeroed",second,b);
+        }
+    }
 
     /* pass 3: orphans -> /lost+found */
     for(int progress=1;progress;){
@@ -570,7 +632,7 @@ int fsck(const char *path, int fix, FILE *log){
     if(fix) fsync(c.fd);
 out:
     free(c.img); free(c.used_ino); free(c.reach); free(c.used_blk);
-    free(c.owner); free(c.dir_seen);
+    free(c.owner); free(c.dir_seen); free(c.conf);
     close(c.fd);
     /* exit nonzero while any problem remains: FATALs are never counted in
        fixed, and fixable problems stay unfixed without --fix */
