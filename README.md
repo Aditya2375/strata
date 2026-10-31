@@ -33,6 +33,12 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
   to the same file is a no-op, `.`/`..` finals and trailing-slash
   mismatches are rejected with EBUSY/EINVAL/ENOTDIR, and `/lost+found`
   itself can neither be renamed nor removed)
+- Trailing-slash semantics follow GNU coreutils exactly, including the
+  one place where coreutils itself is asymmetric: a trailing slash on
+  an existing file is ENOTDIR for every verb, and for a *missing*
+  slash-suffixed destination `mv` says ENOTDIR while `ln` says ENOENT -
+  verified against coreutils 9.x (`mv f missing/` is "Not a directory",
+  `ln f missing/` is "No such file or directory")
 - Write-back cache with explicit `sync`; the shell's `crash K` hook
   flushes only the first K dirty blocks and aborts - a deterministic
   power-fail point
@@ -50,7 +56,7 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
 
 `./tests/run-tests.sh` runs:
 
-- **3,530 unit checks** (allocator cycles, a 2 MiB file crossing into
+- **3,534 unit checks** (allocator cycles, a 2 MiB file crossing into
   indirect blocks with byte-exact read-back, partial block-boundary
   writes, truncation, tombstone reuse, deep nesting, ENOSPC fill)
 - scripted shell cases: basic ops, error paths, persistence across

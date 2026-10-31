@@ -169,13 +169,20 @@ int main(void){
     uint32_t tino; OK(fs_resolve(&f,0,"/tf",&tino)==0);
     struct dinode td; fs_iget(&f,tino,&td);
     OK(td.type==T_FILE);
-    td.mtime=1000; fs_iput(&f,tino,&td);
+    td.mtime=1000; td.ctime=1000; fs_iput(&f,tino,&td);
     OK(fs_touch(&f,0,"/tf")==0);
     struct fs_stat tst; OK(fs_stat(&f,tino,&tst)==0);
     OK(tst.mtime!=1000); /* bumped to now */
+    OK(tst.ctime!=1000); /* ctime bumps too */
     OK(fs_touch(&f,0,"/lost+found")==0); /* directories are touchable */
     OK(fs_touch(&f,0,"/tf/")==-ENOTDIR); /* trailing slash on a file */
     OK(fs_touch(&f,0,"/nope/")==-ENOENT); /* trailing slash on nothing */
+    /* a dangling entry (dentry pointing at a freed inode) is ENOENT */
+    uint32_t dgino; OK(fs_create(&f,0,"/dg",T_FILE,&dgino)==0);
+    struct dinode dd; fs_iget(&f,dgino,&dd);
+    dd.type=T_FREE; fs_iput(&f,dgino,&dd);
+    OK(fs_touch(&f,0,"/dg")==-ENOENT);
+    OK(fs_unlink(&f,0,"/dg")==-ENOENT); /* unlink agrees */
     OK(fs_sync(&f)==0);
     fs_unmount(&f);
     free(wbuf);

@@ -1229,4 +1229,30 @@ print("ok: deep pwd shows an elided tail")
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+echo "--- R11: mv file/ x propagates ENOTDIR; rm of root/dot is EISDIR; arity ---"
+img=$T/r11.img
+$BIN format $img >/dev/null
+out=$(printf 'write /f hello\nmv /f/ /g\ncat /f\nmkdir /d\nrm /\nrm //\nrm /d/.\nrm /d/..\nmv /f /g extra\nln /f a b\nls\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'mv: not a directory' && \
+printf '%s\n' "$out" | grep -q '^hello$' && \
+[ "$(printf '%s\n' "$out" | grep -c 'is a directory')" = 4 ] && \
+printf '%s\n' "$out" | grep -q 'mv: usage: mv A B' && \
+printf '%s\n' "$out" | grep -q 'ln: usage: ln A B' && \
+printf '%s\n' "$out" | grep -q '^f$' && \
+echo "ok: R11 errno propagation, EISDIR root/dot, operand arity" || { echo "FAIL: R11-errno [$out]"; fails=1; }
+
+echo "--- R11: an over-long final line with no trailing newline is refused ---"
+img=$T/r11eof.img
+$BIN format $img >/dev/null
+python3 -c "import sys; sys.stdout.write('mkdir /' + 'z'*4088)" | $BIN shell $img > $T/r11eof.out 2>&1
+grep -q 'line too long' $T/r11eof.out && \
+! printf 'ls\n' | $BIN shell $img 2>&1 | grep -q '^zz' && \
+echo "ok: over-long line at EOF refused" || { echo "FAIL: R11-eof [$(cat $T/r11eof.out)]"; fails=1; }
+
+echo "--- R11: the longest legal line still runs ---"
+python3 -c "print('write /lg ' + 'y'*4082)" | $BIN shell $img > $T/r11max.out 2>&1
+printf 'cat /lg\n' | $BIN shell $img 2>&1 | grep -q 'yyyy' && \
+! grep -q 'line too long' $T/r11max.out && \
+echo "ok: longest legal line still accepted" || { echo "FAIL: R11-maxline [$(cat $T/r11max.out)]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

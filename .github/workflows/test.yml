@@ -29,5 +29,6 @@ jobs:
           version: "6.0.13"
           actions-cache-folder: emsdk-cache
       - run: sh wasm/build.sh
+      - run: node tests/wasm-smoke.js
       - name: committed demo artifacts must match a fresh build
         run: git diff --exit-code --stat docs/

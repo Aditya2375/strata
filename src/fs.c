@@ -416,7 +416,9 @@ int fs_touch(struct fs *f, uint32_t cwd, const char *path){
     if(r==-ENOENT) return fs_create(f,cwd,path,T_FILE,NULL);
     if(r) return r;
     struct dinode d; fs_iget(f,ino,&d);
+    if(d.type==T_FREE) return -ENOENT; /* dangling entry: like stat/unlink */
     d.mtime=now32();
+    d.ctime=now32();
     fs_iput(f,ino,&d);
     return 0;
 }
@@ -543,7 +545,18 @@ int fs_mkdir(struct fs *f, uint32_t cwd, const char *path){
 int fs_unlink(struct fs *f, uint32_t cwd, const char *path){
     char last[STRATA_NAMEMAX+1]; uint32_t par;
     int r=namei(f,cwd,path,NULL,last,&par);
-    if(r||!last[0]||par==UINT32_MAX) return r?r:-ENOENT;
+    if(r) return r;
+    if(!last[0]||par==UINT32_MAX){
+        /* no removable final component: "/", "//", or a path whose final
+           component is "." or "..". They resolve to directories, and rm of
+           a directory is EISDIR (GNU rm says "Is a directory" for these). */
+        uint32_t t;
+        if(namei(f,cwd,path,&t,NULL,NULL)==0){
+            struct dinode d; fs_iget(f,t,&d);
+            if(d.type==T_DIR) return -EISDIR;
+        }
+        return -ENOENT;
+    }
     struct dinode pd; fs_iget(f,par,&pd);
     struct dentry de;
     r=dir_scan(f,&pd,par,last,NULL,&de);
@@ -630,7 +643,8 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     int r=namei(f,cwd,src,NULL,slast,&spar);
     if(r) return r;
     uint32_t sino;
-    if(namei(f,cwd,src,&sino,NULL,NULL)) return -ENOENT;
+    int sr=namei(f,cwd,src,&sino,NULL,NULL);
+    if(sr) return sr;   /* e.g. ENOTDIR for "mv file/ x" - do not mask it */
     if(!slast[0]||spar==UINT32_MAX){
         /* the source path ends in "." or ".." (or is "/"): POSIX rejects
          * renaming those - EINVAL for dot/dotdot, EBUSY for the root */

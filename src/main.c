@@ -11,6 +11,16 @@
 #include <errno.h>
 
 #define LINE 4096
+
+/* Shared by the CLI REPL and the wasm session (which pastes this file into
+   its own translation unit): a command line is at most LINE-2 characters
+   plus its newline. Anything longer is refused whole - never truncated and
+   never executed in pieces. A full fgets buffer with no newline is a long
+   line, including at EOF. */
+static int line_too_long(const char *line){
+    size_t n=strlen(line);
+    return n>=LINE-1 && (n==0 || line[n-1]!='\n');
+}
 static struct fs F;
 static uint32_t CWD;
 static const char *IMG_PATH;
@@ -288,6 +298,7 @@ static int one_cmd(char *line){
         if(!sp){ printf("%s: usage: %s A B\n",cmd,cmd); return 1; }
         *sp=0; char *b=sp+1; while(*b==' '||*b=='\t') b++;
         char *nl=strchr(b,'\n'); if(nl) *nl=0;
+        if(strpbrk(b," \t")){ printf("%s: usage: %s A B\n",cmd,cmd); return 1; }
         int r = !strcmp(cmd,"ln") ? fs_link(&F,CWD,rest,b) : fs_rename(&F,CWD,rest,b);
         if(r) printf("%s: %s\n",cmd,ename(-r));
         else if(!strcmp(cmd,"mv")) cwd_repair();
@@ -350,11 +361,10 @@ int main(int argc, char **argv){
     while(1){
         if(interactive){ char p[1024]; path_of(&F,CWD,p,sizeof p); printf("strata:%s> ",p); fflush(stdout); }
         if(!fgets(line,sizeof line,stdin)) break;
-        if(!strchr(line,'\n') && !feof(stdin)){
-            /* a full buffer with no newline means the line was longer than
-               the buffer: swallow the rest instead of running the tail as
-               a separate command */
-            int ch; while((ch=getchar())!='\n' && ch!=EOF){}
+        if(line_too_long(line)){
+            /* swallow the rest of the over-long line instead of running
+               the tail as a separate command */
+            if(!strchr(line,'\n')){ int ch; while((ch=getchar())!='\n' && ch!=EOF){} }
             printf("line too long\n");
             continue;
         }

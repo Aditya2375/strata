@@ -20,8 +20,13 @@ int strata_boot(void){
 
 EMSCRIPTEN_KEEPALIVE
 void strata_exec(const char *line){
-    char buf[4096];
-    strncpy(buf,line,sizeof buf-1); buf[sizeof buf-1]=0;
+    if(line_too_long(line)){   /* shared with the CLI: refuse, never truncate */
+        printf("line too long\n");
+        fflush(stdout);
+        return;
+    }
+    char buf[LINE];
+    snprintf(buf,sizeof buf,"%s",line);
     /* crash calls _exit and exit ends the REPL: in the browser both kill the
      * emscripten runtime and wedge the session, so refuse them instead */
     const char *p=buf; while(*p==' '||*p=='\t') p++;
