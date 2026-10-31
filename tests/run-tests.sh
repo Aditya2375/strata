@@ -828,4 +828,34 @@ case "$out" in
 esac
 $BIN fsck $img 2>&1 | grep -q clean && n=$(printf 'cat /live\n' | $BIN shell $img 2>/dev/null) && [ "$n" = "precious-data" ]   && echo "ok: reachable owner keeps the block, fsck converges" || { echo "FAIL: R5-5 data [$n]"; fails=1; }
 
+
+echo "--- round-6 regressions ---"
+
+# R6-1: an indirect-table entry duplicating a block the SAME inode already
+# owns must zero the table entry, never direct[i] (stack overflow past
+# direct[11] under ASan for i>=12, and no convergence when nothing is
+# zeroed). Covers indexes below 12, at 30 and at 100.
+for IDX in 5 30 100; do
+  img=$T/r6d$IDX.img
+  $BIN format $img 1024 256 >/dev/null
+  { i=0; while [ $i -lt 100 ]; do printf 'append /big %0600d\n' $i; i=$((i+1)); done; echo sync; } | $BIN shell $img >/dev/null 2>&1
+  python3 - "$img" "$IDX" "$T/r3.py" <<'R6PY'
+import sys; exec(open(sys.argv[3]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d); idx=int(sys.argv[2])
+pb,off,e=find(d,g,g['root'],'big'); bino=s.unpack_from('<I',e,0)[0]
+d.seek(g['it']*BS+bino*128); ino=d.read(128)
+d0=s.unpack_from('<I',ino,36)[0]; ib=s.unpack_from('<I',ino,84)[0]
+assert ib
+d.seek(ib*BS+idx*4); d.write(s.pack('<I',d0))
+d.close()
+R6PY
+  out=$($BIN fsck $img --fix 2>&1)
+  case "$out" in
+    *"duplicate pointer zeroed"*) : ;;
+    *) echo "FAIL: R6-1 idx=$IDX [$out]"; fails=1;;
+  esac
+  $BIN fsck $img 2>&1 | grep -q clean || { echo "FAIL: R6-1 converge idx=$IDX"; fails=1; }
+done
+echo "ok: indirect self-duplicate zeroed at idx 5, 30, 100, converges"
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

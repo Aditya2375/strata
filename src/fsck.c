@@ -131,10 +131,10 @@ static void mark_ino_blocks(ck *c, uint32_t ino, struct dinode *d){
                 if(!b) continue;
                 if(!okblk(c,b)){ report(c,1,"bad indirect entry zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; continue; }
                 if(dup_blk(c,b)){
-            if(c->owner[b]==ino){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); }
-            else log_conflict(c,ino,b);
-            continue;
-        }
+                    if(c->owner[b]==ino){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; }
+                    else log_conflict(c,ino,b);
+                    continue;
+                }
                 claim_blk(c,ino,b);
             }
             if(chg){ cwrite(c,ib); iputd(c,ino,d); }
