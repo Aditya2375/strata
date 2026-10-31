@@ -178,7 +178,9 @@ static int one_cmd(char *line){
             struct fs_stat st; fs_stat(&F,ino,&st);
             if(st.type==T_DIR){ printf("cat: %s: is a directory\n",rest); return 1; }
             char buf[STRATA_BS]; uint64_t off=0, got;
-            while(fs_read(&F,ino,off,buf,sizeof buf,&got)==0 && got){ fwrite(buf,1,got,stdout); off+=got; }
+            int last=-1;
+            while(fs_read(&F,ino,off,buf,sizeof buf,&got)==0 && got){ fwrite(buf,1,got,stdout); last=(unsigned char)buf[got-1]; off+=got; }
+            if(off && last!='\n') putchar('\n');
             if(st.size && off && (off==st.size)) fflush(stdout);
             return 0;
         }

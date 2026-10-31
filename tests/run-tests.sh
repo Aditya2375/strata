@@ -19,7 +19,8 @@ run(){ # name, expected-file, commands...
 
 # --- case: basic files and dirs ---
 cat > $T/basic.exp <<'E'
-hello stratadir       512  links=3   ./
+hello strata
+dir       512  links=3   ./
 dir       512  links=3   ../
 dir       256  links=2   lost+found/
 file       12  links=1   note.txt
@@ -68,14 +69,15 @@ img=$T/persist.img
 $BIN format $img 512 256 >/dev/null
 printf '%s\n' 'mkdir -p' 'mkdir /a' 'write /a/data.txt persisted bytes here' 'sync' | $BIN shell $img >/dev/null 2>&1
 printf '%s\n' 'cat /a/data.txt' 'append /a/data.txt  +more' 'cat /a/data.txt' | $BIN shell $img > $T/persist.out 2>&1
-printf 'persisted bytes herepersisted bytes here +more' > $T/persist.exp
+printf 'persisted bytes here\npersisted bytes here +more\n' > $T/persist.exp
 diff -u $T/persist.exp $T/persist.out > $T/persist.diff || { echo "FAIL: persistence"; fails=1; } 
 [ -s $T/persist.diff ] || echo "ok: persistence"
 
 # --- case: hard links ---
 cat > $T/links.exp <<'E'
 type=file size=5 blocks=1 links=2 mode=644
-hellotype=file size=5 blocks=1 links=1 mode=644
+hello
+type=file size=5 blocks=1 links=1 mode=644
 E
 run links $T/links.exp \
   'write /orig hello' \
@@ -86,7 +88,7 @@ run links $T/links.exp \
   'stat /copy'
 
 # --- case: rename semantics ---
-printf 'content of als: /a: no such file or directory\ncontent of amv: invalid argument\nafter' > $T/rename.exp
+printf 'content of a\nls: /a: no such file or directory\ncontent of a\nmv: invalid argument\nafter\n' > $T/rename.exp
 run rename $T/rename.exp \
   'write /a content of a' \
   'mkdir /sub' \

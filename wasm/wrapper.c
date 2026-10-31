@@ -20,5 +20,6 @@ void strata_exec(const char *line){
     char buf[4096];
     strncpy(buf,line,sizeof buf-1); buf[sizeof buf-1]=0;
     one_cmd(buf);
+    fflush(stdout);
     fs_sync(&F);
 }
