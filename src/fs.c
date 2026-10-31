@@ -45,7 +45,7 @@ static uint32_t balloc(struct fs *f){
     return 0;
 }
 static void bfree(struct fs *f, uint32_t b){
-    if(b<f->sb.data_start||b>=f->sb.nblocks) return;
+    if(b<f->sb.data_start||b>=f->sb.nblocks) return; /* corrupt pointer: nothing to free */
     if(!bit_get(dbmap(f),b)) return;
     bit_clr(dbmap(f),b);
     touch(f,f->sb.dbmap_start + (b/8)/STRATA_BS);
@@ -77,6 +77,7 @@ static void ifree(struct fs *f, uint32_t i){
 
 /* ---- inode I/O ---- */
 void fs_iget(struct fs *f, uint32_t ino, struct dinode *out){
+    if(ino>=f->sb.ninodes){ memset(out,0,sizeof *out); return; } /* corrupt pointer: report as free */
     uint64_t off=(uint64_t)f->sb.itable_start*STRATA_BS + (uint64_t)ino*128;
     const uint8_t *p=f->img+off;
     memset(out,0,sizeof *out);
@@ -102,9 +103,12 @@ void fs_iput(struct fs *f, uint32_t ino, const struct dinode *in){
 uint64_t fs_maxfile(void){ return (uint64_t)(STRATA_NDIRECT + STRATA_BS/4) * STRATA_BS; }
 
 /* ---- block mapping ---- */
+static int okblk_rt(struct fs *f, uint32_t b){ return b>=f->sb.data_start && b<f->sb.nblocks; }
+
 static uint32_t bmap(struct fs *f, struct dinode *ip, uint32_t ino, uint32_t lb, int alloc, int *err){
     *err=0;
     if(lb < STRATA_NDIRECT){
+        if(ip->direct[lb] && !okblk_rt(f,ip->direct[lb])){ *err=EFSCORRUPT; return 0; }
         if(!ip->direct[lb]){
             if(!alloc) return 0;
             ip->direct[lb]=balloc(f);
@@ -115,6 +119,7 @@ static uint32_t bmap(struct fs *f, struct dinode *ip, uint32_t ino, uint32_t lb,
     }
     lb -= STRATA_NDIRECT;
     if(lb >= STRATA_BS/4){ *err=EFBIG; return 0; }
+    if(ip->indirect && !okblk_rt(f,ip->indirect)){ *err=EFSCORRUPT; return 0; }
     if(!ip->indirect){
         if(!alloc) return 0;
         ip->indirect=balloc(f);
@@ -123,6 +128,7 @@ static uint32_t bmap(struct fs *f, struct dinode *ip, uint32_t ino, uint32_t lb,
         fs_iput(f,ino,ip);
     }
     uint32_t *tab=(uint32_t*)blk(f,ip->indirect);
+    if(tab[lb] && !okblk_rt(f,tab[lb])){ *err=EFSCORRUPT; return 0; }
     if(!tab[lb]){
         if(!alloc) return 0;
         tab[lb]=balloc(f);
@@ -138,6 +144,7 @@ static void free_blocks(struct fs *f, struct dinode *ip, uint64_t keep_lbs){
         if(i>=keep_lbs && ip->direct[i]){ bfree(f,ip->direct[i]); ip->direct[i]=0; ip->blocks--; }
     }
     if(ip->indirect){
+        if(!okblk_rt(f,ip->indirect)) return; /* corrupt pointer: leave the blocks marked used */
         uint32_t *tab=(uint32_t*)blk(f,ip->indirect);
         uint32_t start = keep_lbs>STRATA_NDIRECT ? keep_lbs-STRATA_NDIRECT : 0;
         for(uint32_t i=start;i<STRATA_BS/4;i++)
@@ -210,6 +217,7 @@ int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes){
  * the backing file must actually be large enough to hold nblocks. */
 int sb_validate(const struct superblock *sb, uint64_t file_bytes){
     if(sb->magic!=STRATA_MAGIC || sb->block_size!=STRATA_BS) return -EFSCORRUPT;
+    if(sb->nblocks>STRATA_MAX_BLOCKS) return -EFSCORRUPT; /* image too large */
     if(sb->ninodes<2 || sb->ninodes>STRATA_MAX_INODES) return -EFSCORRUPT;
     if(sb->ibmap_start<1) return -EFSCORRUPT;
     if((uint64_t)sb->ibmap_start+sb->ibmap_blocks > sb->dbmap_start) return -EFSCORRUPT;
@@ -404,6 +412,7 @@ int fs_read(struct fs *f, uint32_t ino, uint64_t off, void *buf, uint64_t n, uin
     while(done<n){
         uint64_t pos=off+done;
         int err; uint32_t pb=bmap(f,&d,ino,(uint32_t)(pos/STRATA_BS),0,&err);
+        if(err){ *got=done; return -err; }
         uint32_t chunk=(uint32_t)(STRATA_BS-(pos%STRATA_BS));
         if(chunk>n-done) chunk=(uint32_t)(n-done);
         if(pb) memcpy(dst+done,blk(f,pb)+(pos%STRATA_BS),chunk);
@@ -500,6 +509,7 @@ int fs_rmdir(struct fs *f, uint32_t cwd, const char *path){
     struct dentry de;
     r=dir_scan(f,&pd,par,last,NULL,&de);
     if(r) return r;
+    if(de.ino==f->sb.lnf_ino) return -EPERM; /* /lost+found is fsck's */
     if(de.type!=T_DIR) return -ENOTDIR;
     struct dinode d; fs_iget(f,de.ino,&d);
     for(uint64_t off=0; off<d.size; off+=128){
@@ -536,12 +546,21 @@ int fs_link(struct fs *f, uint32_t cwd, const char *src, const char *dst){
 int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     char slast[STRATA_NAMEMAX+1]; uint32_t spar;
     int r=namei(f,cwd,src,NULL,slast,&spar);
-    if(r||!slast[0]||spar==UINT32_MAX) return r?r:-ENOENT;
+    if(r) return r;
     uint32_t sino;
     if(namei(f,cwd,src,&sino,NULL,NULL)) return -ENOENT;
+    if(!slast[0]||spar==UINT32_MAX){
+        /* the source path ends in "." or ".." (or is "/"): POSIX rejects
+         * renaming those - EINVAL for dot/dotdot, EBUSY for the root */
+        return sino==f->sb.root_ino?-EBUSY:-EINVAL;
+    }
+    if(sino==f->sb.lnf_ino) return -EPERM; /* /lost+found is fsck's */
     struct dinode sd; fs_iget(f,sino,&sd);
     char dlast[STRATA_NAMEMAX+1]; uint32_t dpar;
     r=namei(f,cwd,dst,NULL,dlast,&dpar);
+    size_t dlen=strlen(dst);
+    int dst_slash = dlen>1 && dst[dlen-1]=='/'; /* trailing slash: dst must name a directory */
+    if(r==0 && !dlast[0]) return -EBUSY; /* renaming onto "."/".." or "/" */
     /* rename onto the same name in the same directory is a no-op */
     if(r==0 && spar!=UINT32_MAX){
         uint32_t dino2;
@@ -574,7 +593,8 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
         struct dinode pd; fs_iget(f,dpar,&pd);
         struct dentry de;
         if(dir_scan(f,&pd,dpar,dlast,NULL,&de)) return -EFSCORRUPT;
-        if(sd.type!=T_DIR && de.type==T_DIR) return -EISDIR;
+        if(de.ino==f->sb.lnf_ino) return -EPERM; /* /lost+found is fsck's */
+        if(sd.type!=T_DIR && de.type==T_DIR) return dst_slash?-ENOTDIR:-EISDIR;
         if(sd.type==T_DIR && de.type!=T_DIR) return -ENOTDIR;
         if(de.type==T_DIR){
             struct dinode dd; fs_iget(f,de.ino,&dd);
@@ -592,6 +612,7 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     }
     if(r!=-ENOENT) return r;
     if(!dlast[0]||dpar==UINT32_MAX) return -ENOENT;
+    if(dst_slash && sd.type!=T_DIR) return -ENOTDIR; /* "mv file newdir/" */
     struct dinode spd; fs_iget(f,spar,&spd);
     struct dentry de;
     r=dir_remove(f,&spd,spar,slast,&de);

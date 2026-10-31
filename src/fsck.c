@@ -16,6 +16,8 @@ typedef struct {
     uint8_t *img;
     uint8_t *used_ino, *used_blk;   /* computed truth */
     uint8_t *reach;                 /* reachable from root */
+    uint32_t *owner;                /* first inode claiming each data block */
+    uint8_t *dir_seen;              /* a directory inode already has a dentry */
 } ck;
 
 static uint32_t cg32(const uint8_t *p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
@@ -59,26 +61,39 @@ static void iputd(ck *c, uint32_t ino, const struct dinode *d){
 
 static int okblk(ck *c, uint32_t b){ return b>=c->sb.data_start && b<c->sb.nblocks; }
 
-/* mark blocks of one inode; repair out-of-range pointers */
+/* mark blocks of one inode; repair out-of-range pointers and duplicate
+ * ownership (two inodes sharing a block: the second pointer is zeroed,
+ * which stops rm-of-one corrupting the other at the cost of the second
+ * file's data) */
+static void claim_blk(ck *c, uint32_t ino, uint32_t b){
+    csbit(c->used_blk,b);
+    if(c->owner[b]==UINT32_MAX) c->owner[b]=ino;
+}
+static int dup_blk(ck *c, uint32_t b){
+    return c->owner[b]!=UINT32_MAX; /* any prior owner conflicts */
+}
 static void mark_ino_blocks(ck *c, uint32_t ino, struct dinode *d){
     for(int i=0;i<STRATA_NDIRECT;i++){
         uint32_t b=d->direct[i];
         if(!b) continue;
         if(!okblk(c,b)){ report(c,1,"bad direct pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); continue; }
-        csbit(c->used_blk,b);
+        if(dup_blk(c,b)){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); d->direct[i]=0; d->blocks--; iputd(c,ino,d); continue; }
+        claim_blk(c,ino,b);
     }
     uint32_t ib=d->indirect;
     if(ib){
         if(!okblk(c,ib)){ report(c,1,"bad indirect pointer zeroed",ino,ib); d->indirect=0; d->blocks--; iputd(c,ino,d); }
+        else if(dup_blk(c,ib)){ report(c,1,"duplicate block ownership: duplicate indirect zeroed",ino,ib); d->indirect=0; d->blocks--; iputd(c,ino,d); }
         else{
-            csbit(c->used_blk,ib);
+            claim_blk(c,ino,ib);
             uint32_t *tab=(uint32_t*)cblk(c,ib);
             int chg=0;
             for(uint32_t i=0;i<STRATA_BS/4;i++){
                 uint32_t b=tab[i];
                 if(!b) continue;
                 if(!okblk(c,b)){ report(c,1,"bad indirect entry zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; continue; }
-                csbit(c->used_blk,b);
+                if(dup_blk(c,b)){ report(c,1,"duplicate block ownership: duplicate pointer zeroed",ino,b); tab[i]=0; d->blocks--; chg=1; continue; }
+                claim_blk(c,ino,b);
             }
             if(chg){ cwrite(c,ib); iputd(c,ino,d); }
         }
@@ -86,7 +101,10 @@ static void mark_ino_blocks(ck *c, uint32_t ino, struct dinode *d){
 }
 
 /* directory walk: validate entries, record reachability */
-static void walk_dir(ck *c, uint32_t ino){
+/* iterative tree walk: a deep but valid directory tree must not overflow
+ * the C stack (30k nested dirs are creatable through the shell), so the
+ * pending set lives on the heap */
+static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t *cap){
     if(c->reach[ino]) return;
     c->reach[ino]=1;
     struct dinode d; idata(c,ino,&d);
@@ -118,7 +136,26 @@ static void walk_dir(ck *c, uint32_t ino){
             seen_dotdot=1; continue;
         }
         struct dinode ch; idata(c,e->ino,&ch);
-        if(ch.type==T_DIR) walk_dir(c,e->ino);
+        if(ch.type==T_DIR){
+            if(c->dir_seen[e->ino]){
+                /* a second dentry for a directory inode: strata has no
+                 * directory hard links, so this is corruption, and letting
+                 * fsck bake it into nlink would hide it forever */
+                report(c,1,"directory hard link removed",e->ino,pb);
+                e->ino=UINT32_MAX; cwrite(c,pb);
+                continue;
+            }
+            c->dir_seen[e->ino]=1;
+            if(!c->reach[e->ino]){
+                if(*top==*cap){
+                    size_t ncap=*cap?*cap*2:256;
+                    uint32_t *ns=realloc(*stack,ncap*sizeof *ns);
+                    if(!ns){ fprintf(c->log,"fsck: FATAL: out of memory walking directories\n"); c->errors++; return; }
+                    *stack=ns; *cap=ncap;
+                }
+                (*stack)[(*top)++]=e->ino;
+            }
+        }
         else c->reach[e->ino]=1;
         /* duplicate name check against earlier entries in this dir */
         for(uint64_t o2=0; o2<off; o2+=128){
@@ -138,6 +175,16 @@ static void walk_dir(ck *c, uint32_t ino){
     (void)seen_dot; (void)seen_dotdot;
 }
 
+static void walk_dir(ck *c, uint32_t ino){
+    size_t top=0, cap=256;
+    uint32_t *stack=malloc(cap*sizeof *stack);
+    if(!stack){ fprintf(c->log,"fsck: FATAL: out of memory walking directories\n"); c->errors++; return; }
+    stack[top++]=ino;
+    while(top) walk_one(c, stack[--top], &stack, &top, &cap);
+    free(stack);
+}
+
+static int dir_append(ck *c, uint32_t dino, struct dinode *dd, const struct dentry *de);
 
 /* ensure dir `ino` has a live entry named `name` pointing at `target`; fix or insert */
 static int ensure_entry(ck *c, uint32_t ino, struct dinode *d, const char *name, uint32_t target){
@@ -155,30 +202,14 @@ static int ensure_entry(ck *c, uint32_t ino, struct dinode *d, const char *name,
         }
     }
     /* insert into a tombstone slot, or grow the directory */
-    uint64_t off; uint32_t pb;
-    if(tomb_off!=UINT64_MAX){ off=tomb_off; pb=tomb_pb; }
-    else{
-        off=d->size;
-        uint32_t lb=(uint32_t)(off/STRATA_BS);
-        if(lb<STRATA_NDIRECT) pb=d->direct[lb];
-        else pb=0;
-        if(!pb){
-            uint8_t *dbm=cblk(c,c->sb.dbmap_start);
-            pb=0;
-            for(uint32_t b=c->sb.data_start;b<c->sb.nblocks;b++)
-                if(!cbit(dbm,b)&&!cbit(c->used_blk,b)){ pb=b; csbit(dbm,b); csbit(c->used_blk,b);
-                    cwrite(c,c->sb.dbmap_start+(b/8)/STRATA_BS); memset(cblk(c,b),0,STRATA_BS); break; }
-            if(!pb || lb>=STRATA_NDIRECT) return 0;
-            d->direct[lb]=pb; d->blocks++;
-        }
-        d->size+=128;
-        iputd(c,ino,d);
-    }
     struct dentry de; memset(&de,0,sizeof de);
     de.ino=target; de.type=T_DIR; strncpy(de.name,name,STRATA_NAMEMAX);
-    memcpy(cblk(c,pb)+(off%STRATA_BS),&de,sizeof de);
-    cwrite(c,pb);
-    return 1;
+    if(tomb_off!=UINT64_MAX){
+        memcpy(cblk(c,tomb_pb)+(tomb_off%STRATA_BS),&de,sizeof de);
+        cwrite(c,tomb_pb);
+        return 1;
+    }
+    return dir_append(c,ino,d,&de);
 }
 
 /* count dirents pointing at each inode + subdir counts for link checking */
@@ -204,6 +235,104 @@ static void count_links(ck *c, uint32_t *refs, uint32_t *subdirs, uint32_t *dotd
             if(ch.type==T_DIR){ subdirs[i]++; parent[e->ino]=i; }
         }
     }
+}
+
+/* allocate one fresh zeroed data block; 0 when the image is full */
+static uint32_t ck_balloc(ck *c){
+    uint8_t *db=cblk(c,c->sb.dbmap_start);
+    for(uint32_t b=c->sb.data_start;b<c->sb.nblocks;b++)
+        if(!cbit(db,b)&&!cbit(c->used_blk,b)){
+            csbit(db,b); csbit(c->used_blk,b);
+            cwrite(c,c->sb.dbmap_start+(b/8)/STRATA_BS);
+            memset(cblk(c,b),0,STRATA_BS);
+            return b;
+        }
+    return 0;
+}
+
+/* append one entry to a directory, growing it by one block when the tail
+ * block is full - including through the single-indirect table, so a long
+ * /lost+found (or any long directory) is not stuck at the direct-block
+ * limit. Returns 0 when no block could be allocated. */
+static int dir_append(ck *c, uint32_t dino, struct dinode *dd, const struct dentry *de){
+    uint64_t off=dd->size;
+    uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
+    if(lb<STRATA_NDIRECT){
+        pb=dd->direct[lb];
+        if(!pb){
+            pb=ck_balloc(c);
+            if(!pb) return 0;
+            dd->direct[lb]=pb; dd->blocks++;
+        }
+    } else {
+        uint32_t slot=lb-STRATA_NDIRECT;
+        if(slot>=STRATA_BS/4) return 0; /* past single-indirect capacity */
+        if(!dd->indirect || !okblk(c,dd->indirect)){
+            uint32_t ib=ck_balloc(c);
+            if(!ib) return 0;
+            dd->indirect=ib; dd->blocks++;
+        }
+        uint32_t *tab=(uint32_t*)cblk(c,dd->indirect);
+        pb=tab[slot];
+        if(!pb){
+            pb=ck_balloc(c);
+            if(!pb) return 0;
+            tab[slot]=pb; dd->blocks++;
+            cwrite(c,dd->indirect);
+        }
+    }
+    memcpy(cblk(c,pb)+(off%STRATA_BS),de,sizeof *de); cwrite(c,pb);
+    dd->size+=128; iputd(c,dino,dd);
+    return 1;
+}
+
+/* recreate a missing or clobbered /lost+found: fresh empty dir linked
+ * from the root. Returns the inode, or UINT32_MAX on failure. */
+static uint32_t recreate_lnf(ck *c){
+    if(!c->reach[c->sb.root_ino]) return UINT32_MAX;
+    uint32_t nino=c->sb.lnf_ino;
+    if(c->used_ino[nino]) for(nino=0;nino<c->sb.ninodes&&c->used_ino[nino];nino++);
+    if(nino>=c->sb.ninodes) return UINT32_MAX;
+    uint8_t *dbm=cblk(c,c->sb.dbmap_start);
+    uint32_t pb=0;
+    for(uint32_t b=c->sb.data_start;b<c->sb.nblocks;b++)
+        if(!cbit(dbm,b)&&!cbit(c->used_blk,b)){ pb=b; csbit(dbm,b); csbit(c->used_blk,b); cwrite(c,c->sb.dbmap_start+(b/8)/STRATA_BS); memset(cblk(c,b),0,STRATA_BS); break; }
+    if(!pb) return UINT32_MAX;
+    struct dentry *dd=(struct dentry*)cblk(c,pb);
+    memset(dd,0,STRATA_BS);
+    dd[0].ino=nino; dd[0].type=T_DIR; strcpy(dd[0].name,".");
+    dd[1].ino=c->sb.root_ino; dd[1].type=T_DIR; strcpy(dd[1].name,"..");
+    cwrite(c,pb);
+    struct dinode nd; memset(&nd,0,sizeof nd);
+    nd.type=T_DIR; nd.mode=0755; nd.nlink=2; nd.size=2*128; nd.blocks=1; nd.direct[0]=pb;
+    iputd(c,nino,&nd);
+    csbit(c->used_ino,nino);
+    uint8_t *ibm=cblk(c,c->sb.ibmap_start);
+    csbit(ibm,nino); cwrite(c,c->sb.ibmap_start+(nino/8)/STRATA_BS);
+    /* link it from the root, reusing a dangling "lost+found" entry when
+     * one is there instead of adding a duplicate name */
+    struct dinode rd; idata(c,c->sb.root_ino,&rd);
+    int linked=0;
+    for(uint64_t off=0; off<rd.size && !linked; off+=128){
+        uint32_t lb=(uint32_t)(off/STRATA_BS);
+        uint32_t rpb= lb<STRATA_NDIRECT ? rd.direct[lb] : 0;
+        if(!rpb) break;
+        struct dentry *e=(struct dentry*)(cblk(c,rpb)+(off%STRATA_BS));
+        if(e->ino!=UINT32_MAX && !strncmp(e->name,"lost+found",STRATA_NAMEMAX+1)){
+            e->ino=nino; e->type=T_DIR; cwrite(c,rpb); linked=1;
+        }
+    }
+    if(!linked){
+        struct dentry le; memset(&le,0,sizeof le);
+        le.ino=nino; le.type=T_DIR; strncpy(le.name,"lost+found",STRATA_NAMEMAX);
+        if(!dir_append(c,c->sb.root_ino,&rd,&le)) return UINT32_MAX;
+    }
+    rd.nlink++; iputd(c,c->sb.root_ino,&rd);
+    c->sb.lnf_ino=nino;
+    memcpy(cblk(c,0),&c->sb,sizeof c->sb); cwrite(c,0);
+    c->reach[nino]=1;
+    c->dir_seen[nino]=1;
+    return nino;
 }
 
 /* does /lost+found already contain an entry with this name? */
@@ -235,12 +364,23 @@ int fsck(const char *path, int fix, FILE *log){
     c.used_ino=calloc(c.sb.ninodes,1);
     c.reach=calloc(c.sb.ninodes,1);
     c.used_blk=calloc(c.sb.nblocks,1);
+    c.owner=malloc(c.sb.nblocks*sizeof(uint32_t));
+    for(uint32_t b=0;b<c.sb.nblocks;b++) c.owner[b]=UINT32_MAX;
+    c.dir_seen=calloc(c.sb.ninodes,1);
     for(uint32_t b=0;b<c.sb.data_start;b++) csbit(c.used_blk,b);
 
     /* pass 1: inode truth + block ownership */
     uint8_t *ib=cblk(&c,c.sb.ibmap_start);
     for(uint32_t i=0;i<c.sb.ninodes;i++){
         struct dinode d; idata(&c,i,&d);
+        if(d.type!=T_FREE && d.type!=T_FILE && d.type!=T_DIR){
+            report(&c,1,"unknown inode type: inode freed",i,d.type);
+            if(c.fix){
+                struct dinode z; memset(&z,0,sizeof z); iputd(&c,i,&z);
+                ccbit(ib,i); cwrite(&c,c.sb.ibmap_start+(i/8)/STRATA_BS);
+            }
+            continue;
+        }
         int used=(d.type!=T_FREE), bit=cbit(ib,i);
         if(used && !bit){ report(&c,1,"inode marked free but in use",i,0); csbit(ib,i); cwrite(&c,c.sb.ibmap_start+(i/8)/STRATA_BS); }
         if(!used && bit){ report(&c,1,"inode bitmap set for free inode",i,0); ccbit(ib,i); cwrite(&c,c.sb.ibmap_start+(i/8)/STRATA_BS); }
@@ -260,10 +400,13 @@ int fsck(const char *path, int fix, FILE *log){
             uint32_t lnf=c.sb.lnf_ino;
             struct dinode ld; idata(&c,lnf,&ld);
             if(!c.reach[lnf]||ld.type!=T_DIR){
-                fprintf(log,"fsck: FATAL: /lost+found missing; orphan ino=%u left detached\n",i);
-                c.errors++; continue;
+                if(!c.fix || (lnf=recreate_lnf(&c))==UINT32_MAX){
+                    fprintf(log,"fsck: FATAL: /lost+found missing; orphan ino=%u left detached\n",i);
+                    c.errors++; continue;
+                }
+                report(&c,1,"/lost+found recreated",lnf,0);
+                idata(&c,lnf,&ld);
             }
-            report(&c,1,"orphan inode reattached under /lost+found",i,0);
             if(c.fix){
                 char nm[32]; snprintf(nm,sizeof nm,"ino_%u",i);
                 /* a previous reattach (or a user file) may already hold the
@@ -278,23 +421,16 @@ int fsck(const char *path, int fix, FILE *log){
                 de.ino=i; idata(&c,i,&ld); de.type=(uint8_t)ld.type;
                 strncpy(de.name,nm,STRATA_NAMEMAX);
                 idata(&c,lnf,&ld);
-                uint64_t off=ld.size;
-                uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
-                if(lb<STRATA_NDIRECT) pb=ld.direct[lb];
-                else if(ld.indirect&&okblk(&c,ld.indirect)) pb=((uint32_t*)cblk(&c,ld.indirect))[lb-STRATA_NDIRECT];
-                if(!pb){
-                    /* allocate a fresh block for lost+found growth */
-                    uint8_t *db=cblk(&c,c.sb.dbmap_start);
-                    for(uint32_t b=c.sb.data_start;b<c.sb.nblocks;b++)
-                        if(!cbit(db,b)&&!cbit(c.used_blk,b)){ pb=b; csbit(db,b); csbit(c.used_blk,b); cwrite(&c,c.sb.dbmap_start+(b/8)/STRATA_BS); memset(cblk(&c,b),0,STRATA_BS); break; }
-                    if(pb && lb<STRATA_NDIRECT){ ld.direct[lb]=pb; ld.blocks++; }
-                    else pb=0;
+                /* report only after the entry is really written: printing
+                 * "reattached [fixed]" before a FATAL would claim a fix
+                 * that never happened */
+                if(!dir_append(&c,lnf,&ld,&de)){
+                    fprintf(log,"fsck: FATAL: could not grow /lost+found (orphan ino=%u still detached)\n",i);
+                    c.errors++; continue;
                 }
-                if(pb){
-                    memcpy(cblk(&c,pb)+(off%STRATA_BS),&de,sizeof de); cwrite(&c,pb);
-                    ld.size+=128; iputd(&c,lnf,&ld);
-                } else { fprintf(log,"fsck: FATAL: could not grow /lost+found (orphan ino=%u still detached)\n",i); c.errors++; }
             }
+            report(&c,1,"orphan inode reattached under /lost+found",i,0);
+            { struct dinode od; idata(&c,i,&od); if(od.type==T_DIR) c.dir_seen[i]=1; }
             walk_dir(&c,i); /* children become reachable too */
             progress=1;
         }
@@ -364,6 +500,7 @@ int fsck(const char *path, int fix, FILE *log){
     if(fix) fsync(c.fd);
 out:
     free(c.img); free(c.used_ino); free(c.reach); free(c.used_blk);
+    free(c.owner); free(c.dir_seen);
     close(c.fd);
     /* exit nonzero while any problem remains: FATALs are never counted in
        fixed, and fixable problems stay unfixed without --fix */

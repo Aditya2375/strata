@@ -130,10 +130,17 @@ static int one_cmd(char *line){
                 if(!strcmp(ents[i].name,".")||!strcmp(ents[i].name,"..")) continue;
                 char p[1152];
                 size_t dl=strlen(dir);
+                size_t nl=strlen(ents[i].name);
+                if(dl+(dir[1]?1:0)+nl+1>sizeof p){
+                    /* the stack bounds depth, but path LENGTH overflows
+                     * first: never copy a path that does not fit whole */
+                    fprintf(stderr,"dump: %s%s%s: path too long, entry skipped\n",
+                            dir,dir[1]?"/":"",ents[i].name);
+                    continue;
+                }
                 memcpy(p,dir,dl);
                 if(dir[1]) p[dl++]='/';
-                strncpy(p+dl,ents[i].name,sizeof p-dl-1);
-                p[sizeof p-1]=0;
+                memcpy(p+dl,ents[i].name,nl+1);
                 if(ents[i].type==T_DIR){
                     printf("D %s\n",p);
                     if(top<510){ strcpy(stack[++top],p); istack[top]=ents[i].ino; }

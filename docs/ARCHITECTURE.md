@@ -32,9 +32,12 @@ consistency from the reachable set.
 
 1. superblock sanity (fatal if unusable)
 2. inode bitmap vs inode type field; record blocks owned by each live
-   inode (out-of-range pointers zeroed)
-3. reachability walk from the root; orphan inodes are linked into
-   /lost+found as `ino_N`
+   inode (out-of-range pointers and duplicate ownership zeroed, unknown
+   inode types freed)
+3. reachability walk from the root (iterative, so deep trees cannot
+   overflow the checker; second dentries to a directory are removed as
+   illegal hard links); orphan inodes are linked into /lost+found as
+   `ino_N`, and a missing /lost+found is recreated first
 4. link counts (dirs: 2 + subdirectories; files: referencing entries);
    `.` and `..` entries verified or re-created
 5. data bitmap vs blocks of reachable files (leaks freed, unmarked

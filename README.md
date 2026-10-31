@@ -28,14 +28,19 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
 - Hard links (shared inode, link counts), rename (incl. across
   directories, POSIX edge cases: self-rename is a no-op, renaming a
   directory into its own subtree is rejected, rename onto hard links
-  to the same file is a no-op)
+  to the same file is a no-op, `.`/`..` finals and trailing-slash
+  mismatches are rejected with EBUSY/EINVAL/ENOTDIR, and `/lost+found`
+  itself can neither be renamed nor removed)
 - Write-back cache with explicit `sync`; the shell's `crash K` hook
   flushes only the first K dirty blocks and aborts - a deterministic
   power-fail point
 - `strata fsck IMG [--fix]`: checks bitmaps against actual use,
-  reachability from the root (orphans are reattached under
-  `/lost+found`), directory entry integrity (dangling entries,
-  duplicate names, `.` and `..`), link counts, and free-space counts
+  block ownership (a block claimed by two files is a corruption, the
+  duplicate pointer is zeroed), reachability from the root (orphans are
+  reattached under `/lost+found`, which `fsck` recreates when missing),
+  directory entry integrity (dangling entries, duplicate names,
+  directory hard links, `.` and `..`, unknown inode types), link
+  counts, and free-space counts
 - Honest errors: ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY, ENOSPC,
   EFBIG, EINVAL, EPERM
 
@@ -74,7 +79,8 @@ variable shadowed the caller's.
   it cannot recover data that never reached the disk image.
 - The whole image is cached in memory while mounted (like a ramdisk);
   `sync` flushes dirty blocks. Images are meant to be megabytes, not
-  gigabytes.
+  gigabytes, and anything past 1 GiB (256K blocks) is refused at mount
+  rather than allowed to exhaust memory.
 - Single-indirect addressing only: files are capped at ~4.1 MiB.
 - No permissions enforcement (mode/uid/gid are stored, not checked),
   no symlinks, no sparse-file detection beyond zero-filling.

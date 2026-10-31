@@ -257,6 +257,34 @@ elif mode=='orphan':          # inode in use but no dirent points at it
     d.seek(it_s*BS+100*128+12); d.write(bytes([1,0,0,0]))
     d.seek(ibm_s*BS); bm=bytearray(d.read(BS))
     bm[100//8]|=(1<<(100%8)); d.seek(ibm_s*BS); d.write(bm)
+elif mode=='dupblock':        # two files share one data block
+    d.seek(it_s*BS+36); rb=s.unpack_from('<I',d.read(4))[0]
+    ent={}
+    for i in range(32):
+        d.seek(rb*BS+i*128); e=d.read(128)
+        nm=e[8:8+120].split(b'\0')[0].decode()
+        if nm: ent[nm]=s.unpack_from('<I',e,0)[0]
+    ia=ent['a']; ig=ent['g']
+    d.seek(it_s*BS+ia*128+36); dab=s.unpack_from('<I',d.read(4))[0]
+    d.seek(dab*BS+2*128); e=d.read(128)   # /a entries: . .. f
+    fino=s.unpack_from('<I',e,0)[0]
+    d.seek(it_s*BS+fino*128+36); pb=s.unpack_from('<I',d.read(4))[0]
+    d.seek(it_s*BS+ig*128+36); d.write(s.pack('<I',pb))
+elif mode=='dirhardlink':     # second dentry for /a in the root
+    d.seek(it_s*BS+36); rb=s.unpack_from('<I',d.read(4))[0]
+    ent={}; off=0
+    for i in range(32):
+        d.seek(rb*BS+i*128); e=d.read(128)
+        ino=s.unpack_from('<I',e,0)[0]
+        if ino==0xFFFFFFFF or e[8]==0: break
+        ent[e[8:8+120].split(b'\0')[0].decode()]=ino; off+=128
+    de=bytearray(128); s.pack_into('<I',de,0,ent['a']); de[4]=1; de[8:8+2]=b'al'
+    d.seek(rb*BS+off); d.write(bytes(de))
+    d.seek(it_s*BS+16); sz=s.unpack_from('<Q',d.read(8))[0]
+    d.seek(it_s*BS+16); d.write(s.pack('<Q',sz+128))
+elif mode=='unktype':         # inode with a type fsck does not know
+    d.seek(it_s*BS+100*128); d.write(bytes([9,0]))
+    d.seek(ibm_s*BS); bm=bytearray(d.read(BS)); bm[100//8]|=(1<<(100%8)); d.seek(ibm_s*BS); d.write(bm)
 elif mode=='bad_dotdot':      # break a subdir's '..' to point at itself
     d.seek(it_s*BS)
     # find dir inode for /a: root block has entries; simpler: inode of /a is created early, scan dirs
@@ -278,6 +306,77 @@ corrupt_test dbitmap_set dbitmap_set
 corrupt_test nlink_zero nlink_zero
 corrupt_test orphan orphan
 corrupt_test bad_dotdot bad_dotdot
+corrupt_test dupblock dupblock
+corrupt_test dirhardlink dirhardlink
+corrupt_test unktype unktype
+
+echo "--- round-2 regressions ---"
+# F7: insane block pointers / inode numbers on a valid-geometry image must
+# produce errors, not crashes
+img=$T/badptr.img
+$BIN format $img 512 256 >/dev/null
+printf 'write /a hello\nmkdir /dd\nwrite /dd/x hi\nsync\n' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" <<'PY'
+import sys, struct
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+it_s=struct.unpack_from('<I',sb,32)[0]
+d.seek(it_s*BS+36); rb=struct.unpack_from('<I',d.read(4))[0]
+ent={}
+for i in range(32):
+    d.seek(rb*BS+i*128); e=d.read(128)
+    nm=e[8:8+120].split(b'\0')[0].decode()
+    if nm: ent[nm]=struct.unpack_from('<I',e,0)[0]
+ia=ent['a']; idd=ent['dd']
+d.seek(it_s*BS+ia*128+36); d.write(struct.pack('<I',0x100000))  # insane direct[0]
+d.seek(it_s*BS+idd*128+36); ddb=struct.unpack_from('<I',d.read(4))[0]
+d.seek(ddb*BS+3*128)
+de=bytearray(128); struct.pack_into('<I',de,0,0x00FFFFFF); de[4]=2; de[8:8+3]=b'bad'
+d.write(bytes(de))
+d.seek(it_s*BS+idd*128+16); sz=struct.unpack_from('<Q',d.read(8))[0]
+d.seek(it_s*BS+idd*128+16); d.write(struct.pack('<Q',sz+128))
+d.close()
+PY
+out=$(printf 'cat /a\nls -l /dd\nstat /dd/bad\n' | $BIN shell $img 2>&1) && rc=0 || rc=$?
+if [ "$rc" = "0" ]; then echo "ok: corrupt runtime pointers rejected without a crash"
+else echo "FAIL: corrupt pointers crashed the shell"; fails=1; fi
+
+# F8: more orphans than /lost+found's direct blocks can hold must still be
+# reattached (indirect growth)
+img=$T/flood.img
+$BIN format $img 2048 512 >/dev/null
+python3 - "$img" <<'PY'
+import sys, struct
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+ibm_s=struct.unpack_from('<I',sb,16)[0]
+it_s=struct.unpack_from('<I',sb,32)[0]
+d.seek(ibm_s*BS); bm=bytearray(d.read(BS))
+for i in range(100,500): bm[i//8]|=(1<<(i%8))
+d.seek(ibm_s*BS); d.write(bm)
+for i in range(100,500):
+    d.seek(it_s*BS+i*128); d.write(bytes([2,0]))
+    d.seek(it_s*BS+i*128+12); d.write(bytes([1,0,0,0]))
+d.close()
+PY
+$BIN fsck $img --fix > $T/flood.log 2>&1
+n=$(grep -c reattached $T/flood.log)
+if $BIN fsck $img 2>&1 | grep -q clean && [ "$n" = "400" ]; then
+  echo "ok: 400 orphans reattached through indirect lost+found growth"
+else
+  echo "FAIL: orphan flood (reattached=$n)"; fails=1
+fi
+
+# F9: an oversized image is refused at mount, not OOM-killed
+img=$T/huge.img
+$BIN format $img 512 256 >/dev/null
+python3 - "$img" <<'PY'
+import sys, struct, os
+d=open(sys.argv[1],'r+b'); d.seek(8); d.write(struct.pack('<I',16*1024*1024)); d.close()
+os.truncate(sys.argv[1], 64*1024*1024*1024)
+PY
+printf 'ls\n' | $BIN shell $img > $T/huge.out 2>&1
+grep -q 'cannot mount' $T/huge.out && echo "ok: oversized image refused at mount" || { echo "FAIL: oversized image"; fails=1; }
 
 echo "--- model test vs python reference ---"
 python3 tests/model-test.py $BIN || { echo "FAIL: model test"; fails=1; }

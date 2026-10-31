@@ -15,6 +15,9 @@
 #define STRATA_NAMEMAX   119
 #define STRATA_MAX_INODES 65536
 #define T_FREE 0
+/* hard image size cap: the whole image is mapped into memory, so an
+ * absurd nblocks must be refused at validation, not OOM-kill the host */
+#define STRATA_MAX_BLOCKS (1u<<18) /* 1 GiB */
 #define T_DIR  1
 #define T_FILE 2
 
