@@ -48,17 +48,22 @@
 const out = document.getElementById('out');
 const inp = document.getElementById('in');
 let M = null;
-function print(t){ out.textContent += t; out.scrollTop = out.scrollHeight; }
+let pendingNL = false;
+function print(t){ out.textContent += t; pendingNL = !t.endsWith('\n'); out.scrollTop = out.scrollHeight; }
+function flushNL(){ if (pendingNL) { print('\n'); } }
 function run(line){
+  flushNL();
   print('strata> ' + line + '\n');
   M.ccall('strata_exec', null, ['string'], [line]);
 }
 function seed(){
+  out.textContent = ''; pendingNL = false;
   const cmds = ['mkdir /home', 'mkdir /home/aditya', 'mkdir /etc',
     'write /etc/motd welcome to strata, a tiny unix-like file system',
     'write /home/aditya/todo.txt ship strata, then build a network stack',
     'ln /home/aditya/todo.txt /home/aditya/plan.txt'];
   for (const c of cmds) M.ccall('strata_exec', null, ['string'], [c]);
+  flushNL();
   print('strata ready - a small tree is seeded. Type a command, or click an example.\n');
 }
 StrataModule({ print: print, printErr: function(){} }).then(function(m){
