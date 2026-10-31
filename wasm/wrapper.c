@@ -8,7 +8,7 @@
 EMSCRIPTEN_KEEPALIVE
 int strata_boot(void){
     unlink("/fs.img");
-    if(mkfs("/fs.img",1024,256)) return 1;
+    if(mkfs("/fs.img",1024,256,NULL)) return 1;
     IMG_PATH="/fs.img";
     if(fs_mount(&F,IMG_PATH)) return 2;
     CWD=F.sb.root_ino;

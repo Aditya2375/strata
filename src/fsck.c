@@ -246,6 +246,19 @@ static void walk_dir(ck *c, uint32_t ino){
     free(stack);
 }
 
+static uint32_t count_blocks(ck *c, const struct dinode *d){
+    uint32_t n=0;
+    for(int i=0;i<STRATA_NDIRECT;i++) if(d->direct[i]) n++;
+    if(d->indirect){
+        n++;   /* the indirect block itself */
+        if(okblk(c,d->indirect)){
+            const uint32_t *tab=(const uint32_t*)cblk(c,d->indirect);
+            for(size_t i=0;i<STRATA_BS/4;i++) if(tab[i]) n++;
+        }
+    }
+    return n;
+}
+
 static int dir_append(ck *c, uint32_t dino, struct dinode *dd, const struct dentry *de);
 
 /* ensure dir `ino` has a live entry named `name` pointing at `target`; fix or insert */
@@ -453,7 +466,12 @@ int fsck(const char *path, int fix, FILE *log){
     }
     size_t sz=(size_t)c.sb.nblocks*STRATA_BS;
     c.img=malloc(sz);
-    if(!c.img || pread(c.fd,c.img,sz,0)!=(ssize_t)sz){ fprintf(log,"fsck: short read\n"); free(c.img); close(c.fd); return 1; }
+    if(!c.img){ fprintf(log,"fsck: out of memory\n"); close(c.fd); return 1; }
+    for(size_t off=0;off<sz;){   /* one pread can legally return short */
+        ssize_t r=pread(c.fd,c.img+off,sz-off,(off_t)off);
+        if(r<=0){ fprintf(log,"fsck: short read\n"); free(c.img); close(c.fd); return 1; }
+        off+=(size_t)r;
+    }
     c.used_ino=calloc(c.sb.ninodes,1);
     c.reach=calloc(c.sb.ninodes,1);
     c.used_blk=calloc(c.sb.nblocks,1);
@@ -589,6 +607,8 @@ int fsck(const char *path, int fix, FILE *log){
         uint32_t want = (d.type==T_DIR) ? 2+subs[i] : refs[i];
         if(d.type==T_DIR && i==c.sb.root_ino) want=2+subs[i]; /* "." counts */
         if(d.nlink!=want){ report(&c,1,"link count corrected",i,d.nlink); d.nlink=want; iputd(&c,i,&d); }
+        uint32_t want_blocks=count_blocks(&c,&d);
+        if(d.blocks!=want_blocks){ report(&c,1,"block count corrected",i,d.blocks); d.blocks=want_blocks; iputd(&c,i,&d); }
         if(d.type==T_DIR){
             uint32_t wantdd = (i==c.sb.root_ino) ? i : par[i];
             if(dd[i]!=wantdd){

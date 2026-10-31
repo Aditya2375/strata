@@ -66,7 +66,7 @@ struct fs_stat {
 
 void  fs_iget(struct fs *f, uint32_t ino, struct dinode *out);
 void  fs_iput(struct fs *f, uint32_t ino, const struct dinode *in);
-int   mkfs(const char *path, uint32_t nblocks, uint32_t ninodes);
+int   mkfs(const char *path, uint32_t nblocks, uint32_t ninodes, uint32_t *actual_ninodes);
 int   sb_validate(const struct superblock *sb, uint64_t file_bytes);
 int   fs_mount(struct fs *f, const char *path);
 int   fs_sync(struct fs *f);

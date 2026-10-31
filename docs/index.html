@@ -43,30 +43,28 @@
   </div>
   <p class="note">Commands: ls cd pwd mkdir touch write append cat rm rmdir ln mv stat df dump fsck sync (exit/crash end the session, so they are disabled here)</p>
 </main>
-<script src="strata.js?v=2"></script>
+<script src="strata.js?v=3"></script>
 <script>
 const out = document.getElementById('out');
 const inp = document.getElementById('in');
 let M = null;
-let pendingNL = false;
-function print(t){ out.textContent += t; pendingNL = !t.endsWith('\n'); out.scrollTop = out.scrollHeight; }
-function flushNL(){ if (pendingNL) { print('\n'); } }
+/* emscripten calls print once per output line WITHOUT the trailing newline,
+   so each call must append one full line or multi-line output runs together */
+function print(t){ out.textContent += t + '\n'; out.scrollTop = out.scrollHeight; }
 function run(line){
-  flushNL();
-  print('strata> ' + line + '\n');
+  print('strata> ' + line);
   M.ccall('strata_exec', null, ['string'], [line]);
 }
 function seed(){
-  out.textContent = ''; pendingNL = false;
+  out.textContent = '';
   const cmds = ['mkdir /home', 'mkdir /home/aditya', 'mkdir /etc',
     'write /etc/motd welcome to strata, a tiny unix-like file system',
     'write /home/aditya/todo.txt ship strata, then build a network stack',
     'ln /home/aditya/todo.txt /home/aditya/plan.txt'];
   for (const c of cmds) M.ccall('strata_exec', null, ['string'], [c]);
-  flushNL();
-  print('strata ready - a small tree is seeded. Type a command, or click an example.\n');
+  print('strata ready - a small tree is seeded. Type a command, or click an example.');
 }
-StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=2'; } }).then(function(m){
+StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=3'; } }).then(function(m){
   M = m;
   const rc = M.ccall('strata_boot', 'number', [], []);
   if (rc) { out.textContent = 'boot failed (' + rc + ')'; return; }
@@ -85,7 +83,7 @@ document.querySelectorAll('button').forEach(function(b){
     const c = b.getAttribute('data-c');
     if (c === 'reset') { out.textContent=''; M.ccall('strata_boot','number',[],[]); seed(); return; }
     if (c === 'tree demo') { ['mkdir /usr','mkdir /usr/bin','mkdir /usr/lib','write /usr/bin/sh a real shell is repo #13','write /usr/lib/README libraries would live here'].forEach(run); run('ls -l /usr'); return; }
-    if (c === 'links demo') { run('stat /home/aditya/todo.txt'); run('stat /home/aditya/plan.txt'); run('append /home/aditya/plan.txt  + profit'); run('cat /home/aditya/todo.txt'); print('\n(same inode: appending through one name shows through the other)\n'); return; }
+    if (c === 'links demo') { run('stat /home/aditya/todo.txt'); run('stat /home/aditya/plan.txt'); run('append /home/aditya/plan.txt  + profit'); run('cat /home/aditya/todo.txt'); print(''); print('(same inode: appending through one name shows through the other)'); return; }
     if (c === 'rename demo') { ['write /draft v1','mv /draft /final','ls /','cat /final'].forEach(run); return; }
     run(c);
   });

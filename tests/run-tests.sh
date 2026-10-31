@@ -963,4 +963,36 @@ $BIN fsck $img 2>&1 | grep -q clean || { echo "FAIL: R6b-b converge"; fails=1; }
 out=$(printf 'ls /lost+found\n' | $BIN shell $img 2>&1)
 printf '%s\n' "$out" | grep -q 'ino_100' && printf '%s\n' "$out" | grep -q 'ino_102' && echo "ok: orphans landed in /lost+found" || { echo "FAIL: R6b-b lnf [$out]"; fails=1; }
 
+echo "--- R7: dinode.blocks validated by fsck ---"
+img=$T/r7blocks.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /f hello\n' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" <<'PY'
+import sys, struct
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+it=struct.unpack_from('<I',sb,32)[0]; root=struct.unpack_from('<I',sb,52)[0]
+d.seek(it*BS+root*128); rino=d.read(128)
+rb=struct.unpack_from('<I',rino,36)[0]
+for i in range(32):
+    d.seek(rb*BS+i*128); e=d.read(128)
+    if struct.unpack_from('<I',e,0)[0]==0xFFFFFFFF: break
+    if e[8:9]==b'f':
+        ino=struct.unpack_from('<I',e,0)[0]
+        d.seek(it*BS+ino*128+32); d.write(struct.pack('<I',0xFFFFFFF0))
+d.close()
+PY
+out=$(printf 'stat /f
+' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'blocks=4294967280' || { echo "FAIL: R7 setup [$out]"; fails=1; }
+$BIN fsck $img 2>&1 | grep -q 'block count corrected' && echo "ok: fsck reports wrong block count" || { echo "FAIL: R7 report"; fails=1; }
+$BIN fsck $img --fix >/dev/null 2>&1
+out=$(printf 'stat /f
+' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'blocks=1 ' && $BIN fsck $img 2>&1 | grep -q clean && echo "ok: block count corrected, converges" || { echo "FAIL: R7 fix [$out]"; fails=1; }
+
+echo "--- R7: format prints the real inode count ---"
+out=$($BIN format $T/r7fmt.img 512 100 2>&1)
+printf '%s\n' "$out" | grep -q '128 inodes' && echo "ok: format reports rounded inode count" || { echo "FAIL: R7 format [$out]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

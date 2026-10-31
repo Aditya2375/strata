@@ -11,7 +11,7 @@ static int checks=0;
 
 int main(void){
     unlink("/tmp/strata-unit.img");
-    OK(mkfs("/tmp/strata-unit.img",1024,512)==0);
+    OK(mkfs("/tmp/strata-unit.img",1024,512,NULL)==0);
     struct fs f; OK(fs_mount(&f,"/tmp/strata-unit.img")==0);
     OK(f.sb.root_ino==0 && f.sb.lnf_ino==1);
 

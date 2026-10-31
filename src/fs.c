@@ -157,7 +157,7 @@ static void free_blocks(struct fs *f, struct dinode *ip, uint64_t keep_lbs){
 }
 
 /* ---- mount / sync ---- */
-int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes){
+int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes, uint32_t *actual_ninodes){
     if(ninodes<64||ninodes>STRATA_MAX_INODES) return -1;
     if(nblocks==0||nblocks>STRATA_MAX_BLOCKS) return -1; /* match the mount-side cap */
     if(ninodes%32) ninodes=(ninodes+31)&~31u;
@@ -212,6 +212,7 @@ int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes){
     int ok=(w==(ssize_t)((size_t)nblocks*STRATA_BS));
     fsync(fd); free(img); close(fd);
     (void)tmp;
+    if(ok && actual_ninodes) *actual_ninodes=ninodes;  /* after the 32-way rounding above */
     return ok?0:-1;
 }
 

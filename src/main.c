@@ -280,8 +280,9 @@ int main(int argc, char **argv){
     if(argc>=3 && !strcmp(argv[1],"format")){
         uint32_t nb = argc>3 ? (uint32_t)atoi(argv[3]) : 2048;
         uint32_t ni = argc>4 ? (uint32_t)atoi(argv[4]) : 1024;
-        if(mkfs(argv[2],nb,ni)){ fprintf(stderr,"strata: format failed\n"); return 1; }
-        printf("formatted %s: %u blocks (%u KiB), %u inodes\n",argv[2],nb,nb*4/1,ni);
+        uint32_t real_ni=0;
+        if(mkfs(argv[2],nb,ni,&real_ni)){ fprintf(stderr,"strata: format failed\n"); return 1; }
+        printf("formatted %s: %u blocks (%u KiB), %u inodes\n",argv[2],nb,nb*4/1,real_ni);
         return 0;
     }
     if(argc>=3 && !strcmp(argv[1],"fsck")){
