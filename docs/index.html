@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strata - a small file system</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0d1117; color:#c9d1d9; font:14px/1.5 -apple-system,"Segoe UI",sans-serif; margin:0; padding:2rem; }
+  main { max-width:860px; margin:0 auto; }
+  h1 { font-size:1.3rem; font-weight:600; }
+  h1 .name { color:#7ee787; font-family:ui-monospace,monospace; }
+  a { color:#58a6ff; }
+  .term { background:#010409; border:1px solid #30363d; border-radius:8px; margin-top:1rem; }
+  .termbar { padding:.4rem .8rem; color:#8b949e; font:12px ui-monospace,monospace; border-bottom:1px solid #30363d; }
+  #out { height:340px; overflow-y:auto; padding:.8rem; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; color:#7ee787; }
+  #out .cmd { color:#58a6ff; }
+  #in { width:100%; box-sizing:border-box; background:transparent; border:0; border-top:1px solid #30363d; color:#c9d1d9; padding:.6rem .8rem; font:13px ui-monospace,monospace; outline:none; }
+  .btns { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:1rem; }
+  button { background:#21262d; color:#7ee787; border:1px solid #30363d; border-radius:6px; padding:.45rem .8rem; font:12px ui-monospace,monospace; cursor:pointer; }
+  button:hover { border-color:#7ee787; }
+  .note { color:#8b949e; font-size:.85rem; margin-top:.6rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="name">strata</span> - a small file system</h1>
+  <p>The real file system (inodes, bitmaps, directories, hard links, fsck)
+  compiled to WebAssembly, running in this tab on an in-memory disk image.
+  It disappears when you close the tab. <a href="https://github.com/Aditya2375/strata">Source on GitHub</a>.</p>
+  <div class="btns">
+    <button data-c="ls -l /">ls -l /</button>
+    <button data-c="tree demo">build a tree</button>
+    <button data-c="links demo">hard links</button>
+    <button data-c="rename demo">rename</button>
+    <button data-c="fsck">fsck</button>
+    <button data-c="reset">reset image</button>
+  </div>
+  <div class="term">
+    <div class="termbar">strata - shell session</div>
+    <div id="out">loading wasm…</div>
+    <input id="in" placeholder="strata command (try: help)" disabled>
+  </div>
+  <p class="note">Commands: ls cd pwd mkdir touch write append cat rm rmdir ln mv stat df dump fsck sync exit</p>
+</main>
+<script>
+const out = document.getElementById('out');
+const inp = document.getElementById('in');
+let M = null;
+function print(t){ out.textContent += t; out.scrollTop = out.scrollHeight; }
+function run(line){
+  print('strata> ' + line + '\n');
+  M.ccall('strata_exec', null, ['string'], [line]);
+}
+function seed(){
+  const cmds = ['mkdir /home', 'mkdir /home/aditya', 'mkdir /etc',
+    'write /etc/motd welcome to strata, a tiny unix-like file system',
+    'write /home/aditya/todo.txt ship strata, then build a network stack',
+    'ln /home/aditya/todo.txt /home/aditya/plan.txt'];
+  for (const c of cmds) M.ccall('strata_exec', null, ['string'], [c]);
+  print('strata ready - a small tree is seeded. Type a command, or click an example.\n');
+}
+StrataModule({ print: print, printErr: function(){} }).then(function(m){
+  M = m;
+  const rc = M.ccall('strata_boot', 'number', [], []);
+  if (rc) { out.textContent = 'boot failed (' + rc + ')'; return; }
+  out.textContent = '';
+  seed();
+  inp.disabled = false;
+  inp.focus();
+}).catch(function(e){ out.textContent = 'wasm load failed: ' + e; });
+inp.addEventListener('keydown', function(e){
+  if (e.key !== 'Enter' || !inp.value.trim() || !M) return;
+  run(inp.value.trim()); inp.value = '';
+});
+document.querySelectorAll('button').forEach(function(b){
+  b.addEventListener('click', function(){
+    if (!M) return;
+    const c = b.getAttribute('data-c');
+    if (c === 'reset') { out.textContent=''; M.ccall('strata_boot','number',[],[]); seed(); return; }
+    if (c === 'tree demo') { ['mkdir /usr','mkdir /usr/bin','mkdir /usr/lib','write /usr/bin/sh a real shell is repo #13','write /usr/lib/README libraries would live here'].forEach(run); run('ls -l /usr'); return; }
+    if (c === 'links demo') { run('stat /home/aditya/todo.txt'); run('stat /home/aditya/plan.txt'); run('append /home/aditya/plan.txt  + profit'); run('cat /home/aditya/todo.txt'); print('\n(same inode: appending through one name shows through the other)\n'); return; }
+    if (c === 'rename demo') { ['write /draft v1','mv /draft /final','ls /','cat /final'].forEach(run); return; }
+    run(c);
+  });
+});
+</script>
+<script src="strata.js"></script>
+</body>
+</html>
