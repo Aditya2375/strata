@@ -43,7 +43,7 @@
   </div>
   <p class="note">Commands: ls cd pwd mkdir touch write append cat rm rmdir ln mv stat df dump fsck sync exit</p>
 </main>
-<script src="strata.js"></script>
+<script src="strata.js?v=1"></script>
 <script>
 const out = document.getElementById('out');
 const inp = document.getElementById('in');
@@ -66,7 +66,7 @@ function seed(){
   flushNL();
   print('strata ready - a small tree is seeded. Type a command, or click an example.\n');
 }
-StrataModule({ print: print, printErr: function(){} }).then(function(m){
+StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=1'; } }).then(function(m){
   M = m;
   const rc = M.ccall('strata_boot', 'number', [], []);
   if (rc) { out.textContent = 'boot failed (' + rc + ')'; return; }
