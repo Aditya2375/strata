@@ -7,7 +7,9 @@ It comes with an interactive shell, a real `fsck` that finds and repairs
 corruption, and a crash hook for power-fail testing.
 
 **[Try it in your browser](https://aditya2375.github.io/strata/)** — the
-same C code compiled to WebAssembly.
+same C code compiled to WebAssembly. The demo artifacts in `docs/` are built
+from this source tree with `sh wasm/build.sh` (the CI wasm job rebuilds them
+and fails if the committed files ever drift).
 
 ## Layout
 
@@ -48,7 +50,7 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
 
 `./tests/run-tests.sh` runs:
 
-- **3,520 unit checks** (allocator cycles, a 2 MiB file crossing into
+- **3,530 unit checks** (allocator cycles, a 2 MiB file crossing into
   indirect blocks with byte-exact read-back, partial block-boundary
   writes, truncation, tombstone reuse, deep nesting, ENOSPC fill)
 - scripted shell cases: basic ops, error paths, persistence across

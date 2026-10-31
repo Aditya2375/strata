@@ -73,6 +73,7 @@ int   fs_sync(struct fs *f);
 void  fs_unmount(struct fs *f);
 int   fs_resolve(struct fs *f, uint32_t cwd, const char *path, uint32_t *out);
 int   fs_create(struct fs *f, uint32_t cwd, const char *path, uint16_t type, uint32_t *out);
+int   fs_touch(struct fs *f, uint32_t cwd, const char *path);
 int   fs_read(struct fs *f, uint32_t ino, uint64_t off, void *buf, uint64_t n, uint64_t *got);
 int   fs_write(struct fs *f, uint32_t ino, uint64_t off, const void *buf, uint64_t n);
 int   fs_truncate(struct fs *f, uint32_t ino, uint64_t size);

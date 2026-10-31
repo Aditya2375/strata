@@ -163,6 +163,20 @@ int main(void){
     OK(rc==-ENOSPC || rc==-EFBIG);
     OK(wrote>0);
     OK(fs_sync(&f)==0);
+
+    /* touch: creates a missing file, bumps mtime on an existing one */
+    OK(fs_touch(&f,0,"/tf")==0);
+    uint32_t tino; OK(fs_resolve(&f,0,"/tf",&tino)==0);
+    struct dinode td; fs_iget(&f,tino,&td);
+    OK(td.type==T_FILE);
+    td.mtime=1000; fs_iput(&f,tino,&td);
+    OK(fs_touch(&f,0,"/tf")==0);
+    struct fs_stat tst; OK(fs_stat(&f,tino,&tst)==0);
+    OK(tst.mtime!=1000); /* bumped to now */
+    OK(fs_touch(&f,0,"/lost+found")==0); /* directories are touchable */
+    OK(fs_touch(&f,0,"/tf/")==-ENOTDIR); /* trailing slash on a file */
+    OK(fs_touch(&f,0,"/nope/")==-ENOENT); /* trailing slash on nothing */
+    OK(fs_sync(&f)==0);
     fs_unmount(&f);
     free(wbuf);
     printf("%d checks passed\n",checks);

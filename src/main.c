@@ -57,7 +57,19 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
         if(!found) break;
         cur=par;
     }
-    if(cur!=f->sb.root_ino){ snprintf(out,cap,"?"); return; }
+    if(cur!=f->sb.root_ino){
+        if(n==64){
+            /* deeper than the reconstruction cap: say so, then show the
+               deepest components rather than a bare "?" */
+            size_t used=0; out[0]=0;
+            used+=snprintf(out+used,cap-used,"/...");
+            for(int i=n-1;i>=0 && used<cap;i--)
+                used+=snprintf(out+used,cap-used,"/%s",parts[i]);
+        }else{
+            snprintf(out,cap,"?"); /* broken ".." chain (corrupt image) */
+        }
+        return;
+    }
     size_t used=0; out[0]=0;
     for(int i=n-1;i>=0;i--){
         used+=snprintf(out+used,cap-used,"/%s",parts[i]);
@@ -225,7 +237,7 @@ static int one_cmd(char *line){
         if(!rest||!*rest){ printf("%s: missing operand\n",cmd); return 1; }
         char *nl=strchr(rest,'\n'); if(nl) *nl=0;
         if(!strcmp(cmd,"mkdir")){ int r=fs_mkdir(&F,CWD,rest); if(r) printf("mkdir: %s: %s\n",rest,ename(-r)); return r?1:0; }
-        if(!strcmp(cmd,"touch")){ int r=fs_create(&F,CWD,rest,T_FILE,NULL); if(r&&r!=-EEXIST){ printf("touch: %s: %s\n",rest,ename(-r)); return 1; } return 0; }
+        if(!strcmp(cmd,"touch")){ int r=fs_touch(&F,CWD,rest); if(r){ printf("touch: %s: %s\n",rest,ename(-r)); return 1; } return 0; }
         if(!strcmp(cmd,"rm")){ int r=fs_unlink(&F,CWD,rest); if(r) printf("rm: %s: %s\n",rest,ename(-r)); return r?1:0; }
         if(!strcmp(cmd,"rmdir")){ int r=fs_rmdir(&F,CWD,rest); if(r) printf("rmdir: %s: %s\n",rest,ename(-r)); else cwd_repair(); return r?1:0; }
         if(!strcmp(cmd,"cat")){
@@ -338,6 +350,14 @@ int main(int argc, char **argv){
     while(1){
         if(interactive){ char p[1024]; path_of(&F,CWD,p,sizeof p); printf("strata:%s> ",p); fflush(stdout); }
         if(!fgets(line,sizeof line,stdin)) break;
+        if(!strchr(line,'\n') && !feof(stdin)){
+            /* a full buffer with no newline means the line was longer than
+               the buffer: swallow the rest instead of running the tail as
+               a separate command */
+            int ch; while((ch=getchar())!='\n' && ch!=EOF){}
+            printf("line too long\n");
+            continue;
+        }
         if(one_cmd(line)==-1) break;
     }
     fs_unmount(&F);

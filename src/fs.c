@@ -336,7 +336,14 @@ static int dir_remove(struct fs *f, struct dinode *dp, uint32_t dino, const char
 }
 
 /* ---- path resolution ---- */
-static int namei(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
+/* a trailing slash on a path is a promise that the target is a directory:
+   "rm /f/" must fail ENOTDIR, never delete the file */
+static int trail_slash(const char *path){
+    size_t l=strlen(path);
+    return l>1 && path[l-1]=='/';
+}
+
+static int namei_walk(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
                  char *last, uint32_t *parent){
     uint32_t cur = (path[0]=='/') ? f->sb.root_ino : cwd;
     uint32_t par = cur;
@@ -388,12 +395,43 @@ static int namei(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
     return 0;
 }
 
+static int namei(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
+                 char *last, uint32_t *parent){
+    int r=namei_walk(f,cwd,path,out,last,parent);
+    if(r==0 && out && trail_slash(path)){
+        struct dinode d; fs_iget(f,*out,&d);
+        if(d.type!=T_DIR) return -ENOTDIR;
+    }
+    return r;
+}
+
 int fs_resolve(struct fs *f, uint32_t cwd, const char *path, uint32_t *out){
     return namei(f,cwd,path,out,NULL,NULL);
 }
 
+/* touch: create a missing file, bump mtime on an existing one */
+int fs_touch(struct fs *f, uint32_t cwd, const char *path){
+    uint32_t ino;
+    int r=namei(f,cwd,path,&ino,NULL,NULL);
+    if(r==-ENOENT) return fs_create(f,cwd,path,T_FILE,NULL);
+    if(r) return r;
+    struct dinode d; fs_iget(f,ino,&d);
+    d.mtime=now32();
+    fs_iput(f,ino,&d);
+    return 0;
+}
+
 /* ---- file ops ---- */
 int fs_create(struct fs *f, uint32_t cwd, const char *path, uint16_t type, uint32_t *out){
+    if(type!=T_DIR && trail_slash(path)){
+        /* "touch f/" where f is a file is ENOTDIR, where f is missing is
+           ENOENT, where f is a directory is EISDIR - never create a file */
+        uint32_t t;
+        int rr=namei(f,cwd,path,&t,NULL,NULL);
+        if(rr==0) return -EISDIR;
+        if(rr==-ENOTDIR) return rr;
+        return -ENOENT;
+    }
     char last[STRATA_NAMEMAX+1]; uint32_t par;
     int r=namei(f,cwd,path,NULL,last,&par);
     if(r==0) return -EEXIST;
@@ -514,6 +552,7 @@ int fs_unlink(struct fs *f, uint32_t cwd, const char *path){
     /* decide from the inode, not the dentry: a FILE-typed entry pointing
        at a live directory must not unlink the entry and orphan the whole
        subtree (cd and stat already judge by the inode) */
+    if(trail_slash(path) && d.type!=T_DIR) return -ENOTDIR;
     if(d.type==T_DIR) return -EISDIR;
     if(d.type==T_FREE) return -ENOENT; /* dangling entry: like stat */
     r=dir_remove(f,&pd,par,last,&de);
@@ -563,6 +602,12 @@ int fs_rmdir(struct fs *f, uint32_t cwd, const char *path){
 }
 
 int fs_link(struct fs *f, uint32_t cwd, const char *src, const char *dst){
+    if(trail_slash(dst)){
+        uint32_t t;
+        int rr=namei(f,cwd,dst,&t,NULL,NULL);
+        if(rr) return rr;            /* ENOTDIR for a file, ENOENT if missing */
+        return -EEXIST;              /* directory destinations unsupported */
+    }
     uint32_t sino;
     int r=namei(f,cwd,src,&sino,NULL,NULL);
     if(r) return r;
@@ -601,6 +646,8 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     /* a trailing slash demands a directory target; check before the
        same-inode no-op, or "mv file file/" silently "succeeds" */
     if(dst_slash && sd.type!=T_DIR) return -ENOTDIR;
+    /* "mv d missingdir/": the slash promises a directory that is not there */
+    if(dst_slash && r==-ENOENT) return -ENOTDIR;
     /* rename onto the same name in the same directory is a no-op */
     if(r==0 && spar!=UINT32_MAX){
         uint32_t dino2;

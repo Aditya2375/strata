@@ -1106,14 +1106,13 @@ out=$(printf 'write /g again\n' | $BIN shell $img 2>&1)
 printf '%s\n' "$out" | grep -q '^write: /g:' && \
 echo "ok: dangling write reports an error" || { echo "FAIL: R9-2 [$out]"; fails=1; }
 
-echo "--- R9: file/. is ENOTDIR and ls file/ prints the name ---"
+echo "--- R9: file/. is ENOTDIR ---"
 img=$T/r9e.img
 $BIN format $img 256 128 >/dev/null
 printf 'write /f hello\n' | $BIN shell $img >/dev/null
-out=$(printf 'cat /f/.\nls /f/\n' | $BIN shell $img 2>&1)
+out=$(printf 'cat /f/.\n' | $BIN shell $img 2>&1)
 printf '%s\n' "$out" | grep -q 'cat: /f/.: not a directory' && \
-printf '%s\n' "$out" | grep -q '^f$' && \
-echo "ok: file/. ENOTDIR, ls file/ prints f" || { echo "FAIL: R9-3 [$out]"; fails=1; }
+echo "ok: file/. ENOTDIR" || { echo "FAIL: R9-3 [$out]"; fails=1; }
 
 echo "--- R9: trailing whitespace is not part of names ---"
 img=$T/r9f.img
@@ -1165,5 +1164,69 @@ printf '%s\n' "$out" | grep -q 'rmdir: .: invalid argument' && \
 printf '%s\n' "$out" | grep -q 'rmdir: ..: invalid argument' && \
 printf '%s\n' "$out" | grep -q 'rmdir: /: device or resource busy' && \
 echo "ok: rmdir operand errors match POSIX" || { echo "FAIL: R9-10 [$out]"; fails=1; }
+
+
+echo "--- R10: a trailing slash on a file operand is ENOTDIR everywhere ---"
+img=$T/r10slash.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /f hello\nwrite /g bye\n' | $BIN shell $img >/dev/null
+out=$(printf 'rm /f/\ncat /f/\nstat /f/\ntouch /f/\nwrite /f/ x\nln /f /g/\nmkdir /f/\nmv /f /g/\nrmdir /f/\ncat /f\ncat /g\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'rm: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q 'cat: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q 'stat: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q 'touch: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q 'write: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q 'ln: not a directory' && \
+printf '%s\n' "$out" | grep -q 'mkdir: /f/: already exists' && \
+printf '%s\n' "$out" | grep -q 'mv: not a directory' && \
+printf '%s\n' "$out" | grep -q 'rmdir: /f/: not a directory' && \
+printf '%s\n' "$out" | grep -q '^hello$' && \
+printf '%s\n' "$out" | grep -q '^bye$' && \
+echo "ok: trailing slash on a file is ENOTDIR, file kept" || { echo "FAIL: R10-slash [$out]"; fails=1; }
+
+echo "--- R10: trailing slash on a missing ln/mv destination ---"
+img=$T/r10miss.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /f hello\n' | $BIN shell $img >/dev/null
+out=$(printf 'ln /f /nope/\nmv /f /nope/\ncat /f\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'ln: no such file or directory' && \
+printf '%s\n' "$out" | grep -q 'mv: not a directory' && \
+printf '%s\n' "$out" | grep -q '^hello$' && \
+echo "ok: trailing-slash missing dst refused, source kept" || { echo "FAIL: R10-miss [$out]"; fails=1; }
+
+echo "--- R10: over-long input lines are refused, not split ---"
+img=$T/r10long.img
+$BIN format $img 256 128 >/dev/null
+longarg=$(python3 -c "print('x'*5000)")
+out=$(printf "mkdir $longarg\nls\n" | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'line too long' && \
+printf '%s\n' "$out" | grep -q '^lost+found/$' && \
+! printf '%s\n' "$out" | grep -q '^xxx' && \
+echo "ok: long lines refused atomically" || { echo "FAIL: R10-long [$out]"; fails=1; }
+
+echo "--- R10: pwd past 64 components prints an honest note, not ? ---"
+img=$T/r10deep.img
+$BIN format $img 512 256 >/dev/null
+python3 - "$BIN" "$img" <<'PY'
+import subprocess, sys
+bin_, img = sys.argv[1], sys.argv[2]
+cmds = []
+p = ""
+for i in range(70):
+    p += "/d%02d" % i
+    cmds.append("mkdir " + p)
+cmds.append("cd " + p)
+cmds.append("pwd")
+out = subprocess.run([bin_, "shell", img], input="\n".join(cmds) + "\n",
+                     text=True, capture_output=True).stdout
+lines = [l for l in out.splitlines() if l.startswith("/")]
+assert lines, out[-300:]
+pwd = lines[-1]
+assert pwd != "?", "pwd still prints a bare ?"
+assert pwd.startswith("/.../"), pwd[:120]
+assert pwd.endswith("/d69"), pwd[-40:]
+print("ok: deep pwd shows an elided tail")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
 
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi
