@@ -51,7 +51,8 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
         int found=0;
         for(uint32_t i=0;i<pc;i++)
             if(pe[i].ino==cur && strcmp(pe[i].name,".") && strcmp(pe[i].name,"..")){
-                strncpy(parts[n++],pe[i].name,STRATA_NAMEMAX); found=1; break;
+                strncpy(parts[n],pe[i].name,STRATA_NAMEMAX); parts[n][STRATA_NAMEMAX]=0; n++;
+                found=1; break;
             }
         if(!found) break;
         cur=par;
@@ -62,6 +63,22 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
         used+=snprintf(out+used,cap-used,"/%s",parts[i]);
         if(used>=cap) break;
     }
+}
+
+/* after a rmdir (or a move) the cwd may have been removed or disconnected;
+ * walk ".." up to the root - any broken hop means the chain is gone */
+static void cwd_repair(void){
+    uint32_t cur=CWD;
+    for(uint32_t hops=0;hops<F.sb.ninodes;hops++){
+        struct fs_stat st;
+        if(fs_stat(&F,cur,&st)||st.type!=T_DIR) break;
+        if(cur==F.sb.root_ino) return;
+        uint32_t nxt;
+        if(fs_resolve(&F,cur,"..",&nxt)) break;
+        cur=nxt;
+    }
+    printf("(working directory was removed; moved to /)\n");
+    CWD=F.sb.root_ino;
 }
 
 static int cmd_ls(char *arg){
@@ -81,7 +98,12 @@ static int cmd_ls(char *arg){
     if(fs_stat(&F,ino,&st)){ printf("ls: %s: %s\n",path?path:".",ename(ENOENT)); return 1; }
     if(st.type==T_FILE){
         if(longfmt) printf("file %8llu bytes  links=%u  %s\n",(unsigned long long)st.size,st.nlink,path?path:".");
-        else printf("%s\n",path?(strrchr(path,'/')?strrchr(path,'/')+1:path):".");
+        else{
+            /* "ls file/" would otherwise print an empty name */
+            size_t pl=strlen(path); while(pl>1 && path[pl-1]=='/') pl--;
+            const char *base=path+pl; while(base>path && base[-1]!='/') base--;
+            printf("%.*s\n",(int)(path+pl-base),base);
+        }
         return 0;
     }
     struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
@@ -119,7 +141,13 @@ static int one_cmd(char *line){
     char *cmd=strtok_r(line," \t",&save);
     if(!cmd) return 0;
     char *rest=save;
-    if(rest) rest+=strspn(rest," \t");
+    if(rest){
+        rest+=strspn(rest," \t");
+        /* trailing whitespace is never part of an argument: "mkdir sp "
+         * must not create a directory literally named "sp " */
+        size_t rl=strlen(rest);
+        while(rl && (rest[rl-1]==' '||rest[rl-1]=='\t')) rest[--rl]=0;
+    }
     if(!strcmp(cmd,"dump")){
         /* deterministic full-tree dump: "F path size fnv1a64" / "D path" */
         char stack[512][1152]; uint32_t istack[512]; int top=0;
@@ -199,7 +227,7 @@ static int one_cmd(char *line){
         if(!strcmp(cmd,"mkdir")){ int r=fs_mkdir(&F,CWD,rest); if(r) printf("mkdir: %s: %s\n",rest,ename(-r)); return r?1:0; }
         if(!strcmp(cmd,"touch")){ int r=fs_create(&F,CWD,rest,T_FILE,NULL); if(r&&r!=-EEXIST){ printf("touch: %s: %s\n",rest,ename(-r)); return 1; } return 0; }
         if(!strcmp(cmd,"rm")){ int r=fs_unlink(&F,CWD,rest); if(r) printf("rm: %s: %s\n",rest,ename(-r)); return r?1:0; }
-        if(!strcmp(cmd,"rmdir")){ int r=fs_rmdir(&F,CWD,rest); if(r) printf("rmdir: %s: %s\n",rest,ename(-r)); return r?1:0; }
+        if(!strcmp(cmd,"rmdir")){ int r=fs_rmdir(&F,CWD,rest); if(r) printf("rmdir: %s: %s\n",rest,ename(-r)); else cwd_repair(); return r?1:0; }
         if(!strcmp(cmd,"cat")){
             uint32_t ino; int r=fs_resolve(&F,CWD,rest,&ino);
             if(r){ printf("cat: %s: %s\n",rest,ename(-r)); return 1; }
@@ -233,7 +261,8 @@ static int one_cmd(char *line){
         uint32_t ino; int r=fs_resolve(&F,CWD,rest,&ino);
         if(r==-ENOENT){ r=fs_create(&F,CWD,rest,T_FILE,&ino); }
         if(r){ printf("%s: %s: %s\n",cmd,rest,ename(-r)); return 1; }
-        struct fs_stat st; fs_stat(&F,ino,&st);
+        struct fs_stat st;
+        if((r=fs_stat(&F,ino,&st))){ printf("%s: %s: %s\n",cmd,rest,ename(-r)); return 1; }
         if(st.type==T_DIR){ printf("%s: %s: is a directory\n",cmd,rest); return 1; }
         uint64_t off = !strcmp(cmd,"append") ? st.size : 0;
         r=fs_write(&F,ino,off,text,strlen(text));
@@ -249,6 +278,7 @@ static int one_cmd(char *line){
         char *nl=strchr(b,'\n'); if(nl) *nl=0;
         int r = !strcmp(cmd,"ln") ? fs_link(&F,CWD,rest,b) : fs_rename(&F,CWD,rest,b);
         if(r) printf("%s: %s\n",cmd,ename(-r));
+        else if(!strcmp(cmd,"mv")) cwd_repair();
         return r?1:0;
     }
     if(!strcmp(cmd,"df")){
@@ -277,6 +307,9 @@ static int one_cmd(char *line){
 }
 
 int main(int argc, char **argv){
+    if(argc>=2 && (!strcmp(argv[1],"format")||!strcmp(argv[1],"fsck")||!strcmp(argv[1],"shell")) && argc<3){
+        fprintf(stderr,"usage: strata %s IMG ...\n",argv[1]); return 1;
+    }
     if(argc>=3 && !strcmp(argv[1],"format")){
         uint32_t nb = argc>3 ? (uint32_t)atoi(argv[3]) : 2048;
         uint32_t ni = argc>4 ? (uint32_t)atoi(argv[4]) : 1024;

@@ -178,11 +178,16 @@ static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t 
             continue;
         }
         if(!strcmp(e->name,".")){
+            if(seen_dot){ report(c,1,"duplicate '.' entry removed",ino,pb); e->ino=UINT32_MAX; cwrite(c,pb); continue; }
             seen_dot=1;
             if(e->ino!=ino){ report(c,1,"'.' entry corrected",ino,e->ino); e->ino=ino; e->type=T_DIR; cwrite(c,pb); }
             continue;
         }
         if(!strcmp(e->name,"..")){
+            /* keep the FIRST "..": count_links and pass 4 both operate on
+             * the surviving entry, so a duplicate would ping-pong between
+             * "corrected" reports forever and never converge */
+            if(seen_dotdot){ report(c,1,"duplicate '..' entry removed",ino,pb); e->ino=UINT32_MAX; cwrite(c,pb); continue; }
             seen_dotdot=1; continue;
         }
         /* duplicate name check against earlier entries in this dir -
@@ -384,6 +389,10 @@ static uint32_t recreate_lnf(ck *c){
                 /* a "lost+found" that is not a directory is corruption, not
                  * a slot to resurrect: tombstone it and keep scanning, or
                  * the next run would duplicate the name and never converge */
+                /* the clobbered inode may already have been walked this
+                 * run (as a file); clear its flags or pass 3/4 treat it as
+                 * live and the image takes a second run to converge */
+                if(e->ino<c->sb.ninodes){ c->reach[e->ino]=0; c->dir_seen[e->ino]=0; }
                 e->ino=UINT32_MAX; cwrite(c,rpb);
                 continue;
             }

@@ -191,7 +191,6 @@ int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes, uint32_t *actual_
     root.type=T_DIR; root.mode=0755; root.nlink=3; root.mtime=root.ctime=now32();
     struct dinode lnf=root; lnf.nlink=2;
     uint8_t *it=img+(size_t)sb.itable_start*STRATA_BS;
-    uint8_t tmp[128];
     #define ENC(p,d) do{ uint8_t *q=(p); p16(q,(d).type);p16(q+2,(d).mode);p32(q+4,(d).uid);p32(q+8,(d).gid);p32(q+12,(d).nlink);p64(q+16,(d).size);p32(q+24,(d).mtime);p32(q+28,(d).ctime);p32(q+32,(d).blocks);for(int i=0;i<STRATA_NDIRECT;i++)p32(q+36+i*4,(d).direct[i]);p32(q+36+STRATA_NDIRECT*4,(d).indirect);}while(0)
     /* allocate two data blocks for the two dirs */
     uint32_t rb=meta, lb=meta+1;
@@ -211,7 +210,6 @@ int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes, uint32_t *actual_
     ssize_t w=pwrite(fd,img,(size_t)nblocks*STRATA_BS,0);
     int ok=(w==(ssize_t)((size_t)nblocks*STRATA_BS));
     fsync(fd); free(img); close(fd);
-    (void)tmp;
     if(ok && actual_ninodes) *actual_ninodes=ninodes;  /* after the 32-way rounding above */
     return ok?0:-1;
 }
@@ -352,9 +350,11 @@ static int namei(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
     if(last) last[0]=0;
     while(tok){
         if(strlen(tok)>STRATA_NAMEMAX) return -ENAMETOOLONG;
-        if(!strcmp(tok,".")){ prev=tok; tok=strtok_r(NULL,"/",&save); continue; }
+        /* the parent-is-a-directory check must run for "." too, or
+         * "cat file/." silently treats a file as a directory */
         struct dinode d; fs_iget(f,cur,&d);
         if(d.type!=T_DIR) return -ENOTDIR;
+        if(!strcmp(tok,".")){ prev=tok; tok=strtok_r(NULL,"/",&save); continue; }
         if(!strcmp(tok,"..")){
             struct dentry de;
             if(dir_scan(f,&d,cur,"..",NULL,&de)) return -EFSCORRUPT;
@@ -527,9 +527,18 @@ int fs_rmdir(struct fs *f, uint32_t cwd, const char *path){
     char last[STRATA_NAMEMAX+1]; uint32_t par;
     int r=namei(f,cwd,path,NULL,last,&par);
     if(r) return r;
-    /* "/" (or a lone "."/".."): namei resolves it but there is no final
-       component to remove - POSIX says the root is busy */
-    if(!last[0]) return -EBUSY;
+    /* no removable final component: a trailing "." or ".." operand is a
+       bad argument (EINVAL) even when it resolves to the root; anything
+       else that lands here is the root itself, which is busy */
+    if(!last[0]){
+        const char *e=path+strlen(path);
+        while(e>path && e[-1]=='/') e--;
+        const char *p=e;
+        while(p>path && p[-1]!='/') p--;
+        size_t l=(size_t)(e-p);
+        if((l==1 && p[0]=='.') || (l==2 && p[0]=='.' && p[1]=='.')) return -EINVAL;
+        return -EBUSY;
+    }
     if(par==UINT32_MAX) return -ENOENT;
     struct dinode pd; fs_iget(f,par,&pd);
     struct dentry de;
@@ -589,6 +598,9 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     size_t dlen=strlen(dst);
     int dst_slash = dlen>1 && dst[dlen-1]=='/'; /* trailing slash: dst must name a directory */
     if(r==0 && !dlast[0]) return -EBUSY; /* renaming onto "."/".." or "/" */
+    /* a trailing slash demands a directory target; check before the
+       same-inode no-op, or "mv file file/" silently "succeeds" */
+    if(dst_slash && sd.type!=T_DIR) return -ENOTDIR;
     /* rename onto the same name in the same directory is a no-op */
     if(r==0 && spar!=UINT32_MAX){
         uint32_t dino2;
@@ -641,7 +653,6 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     }
     if(r!=-ENOENT) return r;
     if(!dlast[0]||dpar==UINT32_MAX) return -ENOENT;
-    if(dst_slash && sd.type!=T_DIR) return -ENOTDIR; /* "mv file newdir/" */
     struct dinode spd; fs_iget(f,spar,&spd);
     struct dentry de;
     r=dir_remove(f,&spd,spar,slast,&de);

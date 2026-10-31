@@ -7,6 +7,9 @@
 
 EMSCRIPTEN_KEEPALIVE
 int strata_boot(void){
+    static int booted=0;
+    if(booted) fs_unmount(&F);   /* reset: release the previous image's memory */
+    booted=1;
     unlink("/fs.img");
     if(mkfs("/fs.img",1024,256,NULL)) return 1;
     IMG_PATH="/fs.img";

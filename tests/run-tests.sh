@@ -1023,4 +1023,147 @@ printf '%s\n' "$out" | grep -q 'rmdir: /: device or resource busy' && \
 printf '%s\n' "$out" | grep -q 'rmdir: /nope: no such file or directory' && \
 echo "ok: rmdir / is busy, rmdir missing is ENOENT" || { echo "FAIL: R8-rmdir [$out]"; fails=1; }
 
+
+echo "--- R9: duplicate '..' entries are removed and fsck converges ---"
+img=$T/r9a.img
+$BIN format $img 256 128 >/dev/null
+printf 'mkdir /a\n' | $BIN shell $img >/dev/null
+python3 - $img <<'PY'
+import struct, sys
+img=open(sys.argv[1],'r+b')
+img.seek(0); sb=img.read(64)
+it=struct.unpack('<I',sb[32:36])[0]
+img.seek(it*4096+2*128+36); ad=struct.unpack('<12I',img.read(48))  # /a is ino 2 on a fresh image
+apos=ad[0]*4096
+img.seek(apos); blk=bytearray(img.read(4096))
+struct.pack_into('<II',blk,256,0,2)   # second ".." -> root
+blk[256+8:256+10]=b'..'
+img.seek(it*4096+2*128+16); img.write(struct.pack('<Q',384))
+img.seek(apos); img.write(blk); img.close()
+PY
+out1=$($BIN fsck $img --fix 2>&1)
+out2=$($BIN fsck $img --fix 2>&1)
+printf '%s\n' "$out1" | grep -q "duplicate '..' entry removed" && \
+printf '%s\n' "$out2" | grep -q 'fsck: clean' && \
+echo "ok: duplicate '..' tombstoned, converges in one run" || { echo "FAIL: R9-A [$out1][$out2]"; fails=1; }
+
+echo "--- R9: bad first '..' plus correct second is not a false clean ---"
+img=$T/r9b.img
+$BIN format $img 256 128 >/dev/null
+printf 'mkdir /a\n' | $BIN shell $img >/dev/null
+python3 - $img <<'PY'
+import struct, sys
+img=open(sys.argv[1],'r+b')
+img.seek(0); sb=img.read(64)
+it=struct.unpack('<I',sb[32:36])[0]; lnf=struct.unpack('<I',sb[56:60])[0]
+img.seek(it*4096+2*128+36); ad=struct.unpack('<12I',img.read(48))
+apos=ad[0]*4096
+img.seek(apos); blk=bytearray(img.read(4096))
+struct.pack_into('<I',blk,128,lnf)    # first ".." -> /lost+found
+struct.pack_into('<II',blk,256,0,2)   # correct second ".." -> root
+blk[256+8:256+10]=b'..'
+img.seek(it*4096+2*128+16); img.write(struct.pack('<Q',384))
+img.seek(apos); img.write(blk); img.close()
+PY
+out1=$($BIN fsck $img --fix 2>&1)
+out2=$($BIN fsck $img --fix 2>&1)
+nav=$(printf 'cd /a\ncd ..\npwd\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out1" | grep -q "'..' entry corrected" && \
+printf '%s\n' "$out2" | grep -q 'fsck: clean' && \
+printf '%s\n' "$nav" | grep -q '^/$' && \
+echo "ok: false-clean '..' fixed, navigation correct" || { echo "FAIL: R9-B [$out1][$out2][$nav]"; fails=1; }
+
+echo "--- R9: clobbered lost+found inode converges in one fsck run ---"
+img=$T/r9c.img
+$BIN format $img 256 128 >/dev/null
+python3 - $img <<'PY'
+import struct, sys
+img=open(sys.argv[1],'r+b')
+img.seek(0); sb=img.read(64)
+it=struct.unpack('<I',sb[32:36])[0]; lnf=struct.unpack('<I',sb[56:60])[0]
+img.seek(it*4096+lnf*128); img.write(struct.pack('<H',2))  # type dir -> file
+img.close()
+PY
+out1=$($BIN fsck $img --fix 2>&1)
+out2=$($BIN fsck $img --fix 2>&1)
+printf '%s\n' "$out1" | grep -q 'problem' && \
+printf '%s\n' "$out2" | grep -q 'fsck: clean' && \
+echo "ok: lost+found recreated and converges in one run" || { echo "FAIL: R9-1 [$out1][$out2]"; fails=1; }
+
+echo "--- R9: write to a dangling entry is a clean error ---"
+img=$T/r9d.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /g hello\n' | $BIN shell $img >/dev/null
+python3 - $img <<'PY'
+import struct, sys
+img=open(sys.argv[1],'r+b')
+img.seek(0); sb=img.read(64)
+it=struct.unpack('<I',sb[32:36])[0]
+img.seek(it*4096+2*128); img.write(struct.pack('<H',0))  # free /g's inode, keep the dentry
+img.close()
+PY
+out=$(printf 'write /g again\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q '^write: /g:' && \
+echo "ok: dangling write reports an error" || { echo "FAIL: R9-2 [$out]"; fails=1; }
+
+echo "--- R9: file/. is ENOTDIR and ls file/ prints the name ---"
+img=$T/r9e.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /f hello\n' | $BIN shell $img >/dev/null
+out=$(printf 'cat /f/.\nls /f/\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'cat: /f/.: not a directory' && \
+printf '%s\n' "$out" | grep -q '^f$' && \
+echo "ok: file/. ENOTDIR, ls file/ prints f" || { echo "FAIL: R9-3 [$out]"; fails=1; }
+
+echo "--- R9: trailing whitespace is not part of names ---"
+img=$T/r9f.img
+$BIN format $img 256 128 >/dev/null
+out=$(printf 'mkdir sp \nstat sp\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'type=dir' && \
+echo "ok: trailing whitespace trimmed" || { echo "FAIL: R9-4 [$out]"; fails=1; }
+
+echo "--- R9: mv file file/ is ENOTDIR, not a silent no-op ---"
+img=$T/r9g.img
+$BIN format $img 256 128 >/dev/null
+printf 'write /t data\n' | $BIN shell $img >/dev/null
+out=$(printf 'mv /t /t/\nstat /t\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'mv: not a directory' && \
+printf '%s\n' "$out" | grep -q 'type=file' && \
+echo "ok: mv file file/ refused" || { echo "FAIL: R9-5 [$out]"; fails=1; }
+
+echo "--- R9: 119-byte names survive pwd ---"
+img=$T/r9h.img
+$BIN format $img 256 128 >/dev/null
+name=$(python3 -c "print('x'*119)")
+out=$(printf "mkdir /$name\ncd /$name\npwd\n" | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q "^/$name\$" && \
+echo "ok: 119-byte name terminates in pwd" || { echo "FAIL: R9-6 [$out]"; fails=1; }
+
+echo "--- R9: CLI verbs without an operand print usage ---"
+out=$($BIN format 2>&1); rc1=$?
+out2=$($BIN fsck 2>&1); rc2=$?
+printf '%s\n' "$out" | grep -q 'usage: strata format' && [ $rc1 -eq 1 ] && \
+printf '%s\n' "$out2" | grep -q 'usage: strata fsck' && [ $rc2 -eq 1 ] && \
+echo "ok: usage on missing operand" || { echo "FAIL: R9-8 [$out][$out2]"; fails=1; }
+
+echo "--- R9: rmdir of the working directory is handled sanely ---"
+img=$T/r9i.img
+$BIN format $img 256 128 >/dev/null
+out=$(printf 'mkdir /d\ncd /d\nrmdir /d\npwd\n' | $BIN shell $img 2>&1)
+fsckout=$($BIN fsck $img 2>&1)
+printf '%s\n' "$out" | grep -q 'working directory was removed' && \
+printf '%s\n' "$out" | grep -q '^/$' && \
+printf '%s\n' "$fsckout" | grep -q 'fsck: clean' && \
+echo "ok: rmdir of cwd moves shell to /" || { echo "FAIL: R9-9 [$out][$fsckout]"; fails=1; }
+
+echo "--- R9: rmdir ./.. are EINVAL, / stays EBUSY ---"
+img=$T/r9j.img
+$BIN format $img 256 128 >/dev/null
+printf 'mkdir /x\n' | $BIN shell $img >/dev/null
+out=$(printf 'cd /x\nrmdir .\nrmdir ..\nrmdir /\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'rmdir: .: invalid argument' && \
+printf '%s\n' "$out" | grep -q 'rmdir: ..: invalid argument' && \
+printf '%s\n' "$out" | grep -q 'rmdir: /: device or resource busy' && \
+echo "ok: rmdir operand errors match POSIX" || { echo "FAIL: R9-10 [$out]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi
