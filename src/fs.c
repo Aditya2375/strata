@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static uint16_t g16(const uint8_t *p){return (uint16_t)(p[0]|(p[1]<<8));}
@@ -204,13 +205,35 @@ int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes){
     return ok?0:-1;
 }
 
+/* Validate on-disk geometry before any field is trusted: regions must be
+ * ordered and non-overlapping inside the image, every index must fit, and
+ * the backing file must actually be large enough to hold nblocks. */
+int sb_validate(const struct superblock *sb, uint64_t file_bytes){
+    if(sb->magic!=STRATA_MAGIC || sb->block_size!=STRATA_BS) return -EFSCORRUPT;
+    if(sb->ninodes<2 || sb->ninodes>STRATA_MAX_INODES) return -EFSCORRUPT;
+    if(sb->ibmap_start<1) return -EFSCORRUPT;
+    if((uint64_t)sb->ibmap_start+sb->ibmap_blocks > sb->dbmap_start) return -EFSCORRUPT;
+    if((uint64_t)sb->dbmap_start+sb->dbmap_blocks > sb->itable_start) return -EFSCORRUPT;
+    if((uint64_t)sb->itable_start+sb->itable_blocks > sb->data_start) return -EFSCORRUPT;
+    if(sb->data_start>=sb->nblocks) return -EFSCORRUPT;
+    if((uint64_t)sb->ibmap_blocks*STRATA_BS*8 < sb->ninodes) return -EFSCORRUPT;
+    if((uint64_t)sb->dbmap_blocks*STRATA_BS*8 < sb->nblocks) return -EFSCORRUPT;
+    if((uint64_t)sb->itable_blocks*STRATA_BS < (uint64_t)sb->ninodes*128) return -EFSCORRUPT;
+    if(sb->root_ino>=sb->ninodes || sb->lnf_ino>=sb->ninodes) return -EFSCORRUPT;
+    if(file_bytes < (uint64_t)sb->nblocks*STRATA_BS) return -EFSCORRUPT;
+    return 0;
+}
+
 int fs_mount(struct fs *f, const char *path){
     memset(f,0,sizeof *f);
     f->fd=open(path,O_RDWR);
     if(f->fd<0) return -errno;
     struct superblock sb;
-    if(pread(f->fd,&sb,sizeof sb,0)!=(ssize_t)sizeof sb || sb.magic!=STRATA_MAGIC || sb.block_size!=STRATA_BS){
-        close(f->fd); return -EINVAL;
+    struct stat st;
+    if(pread(f->fd,&sb,sizeof sb,0)!=(ssize_t)sizeof sb ||
+       fstat(f->fd,&st)!=0 || !S_ISREG(st.st_mode) ||
+       sb_validate(&sb,(uint64_t)st.st_size)){
+        close(f->fd); return -EFSCORRUPT;
     }
     f->sb=sb;
     f->img=malloc((size_t)sb.nblocks*STRATA_BS);
@@ -314,6 +337,7 @@ static int namei(struct fs *f, uint32_t cwd, const char *path, uint32_t *out,
     const char *prev=NULL;
     if(last) last[0]=0;
     while(tok){
+        if(strlen(tok)>STRATA_NAMEMAX) return -ENAMETOOLONG;
         if(!strcmp(tok,".")){ prev=tok; tok=strtok_r(NULL,"/",&save); continue; }
         struct dinode d; fs_iget(f,cur,&d);
         if(d.type!=T_DIR) return -ENOTDIR;
@@ -365,7 +389,8 @@ int fs_create(struct fs *f, uint32_t cwd, const char *path, uint16_t type, uint3
     if(pd.type!=T_DIR) return -ENOTDIR;
     uint32_t ino=ialloc(f,type);
     if(ino==UINT32_MAX) return -ENOSPC;
-    if(dir_add(f,&pd,par,last,ino,(uint8_t)type)){ ifree(f,ino); return -ENOSPC; }
+    int e=dir_add(f,&pd,par,last,ino,(uint8_t)type);
+    if(e){ ifree(f,ino); return e; }
     if(out) *out=ino;
     return 0;
 }
@@ -435,8 +460,18 @@ int fs_mkdir(struct fs *f, uint32_t cwd, const char *path){
     struct dinode d; fs_iget(f,ino,&d);
     /* parent for ".." */
     char last[STRATA_NAMEMAX+1]; uint32_t par;
-    namei(f,cwd,path,NULL,last,&par);
-    if(dir_add(f,&d,ino,".",ino,T_DIR)||dir_add(f,&d,ino,"..",par,T_DIR)) return -ENOSPC;
+    r=namei(f,cwd,path,NULL,last,&par);
+    if(r){ free_blocks(f,&d,0); ifree(f,ino); return r; }
+    int e=dir_add(f,&d,ino,".",ino,T_DIR);
+    if(!e) e=dir_add(f,&d,ino,"..",par,T_DIR);
+    if(e){
+        /* roll back so a failed mkdir never leaves a half-initialized
+         * directory: drop the parent's entry, free the inode's blocks */
+        struct dinode pd; fs_iget(f,par,&pd);
+        dir_remove(f,&pd,par,last,NULL);
+        free_blocks(f,&d,0); ifree(f,ino);
+        return e;
+    }
     fs_iget(f,par,&d);
     d.nlink++; fs_iput(f,par,&d);
     return 0;
@@ -518,16 +553,20 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
          * src the move would create a cycle */
         if(r==-ENOENT && dpar==UINT32_MAX) return -ENOENT;
         if(r && r!=-ENOENT) return r;
-        uint32_t cur=dpar;
-        for(int hops=0; hops<256; hops++){
+        uint32_t cur=dpar; int stopped=0;
+        /* bound by the inode count, not a constant: a ".." walk longer than
+         * ninodes revisits an inode, which means the chain itself is broken */
+        for(uint32_t hops=0; hops<f->sb.ninodes; hops++){
             if(cur==sino) return -EINVAL;
-            if(cur==f->sb.root_ino) break;
+            if(cur==f->sb.root_ino){ stopped=1; break; }
             struct dinode d; fs_iget(f,cur,&d);
-            if(d.type!=T_DIR) break;
+            if(d.type!=T_DIR){ stopped=1; break; }
             struct dentry de;
-            if(dir_scan(f,&d,cur,"..",NULL,&de)) break;
+            if(dir_scan(f,&d,cur,"..",NULL,&de)){ stopped=1; break; }
+            if(de.ino==cur){ stopped=1; break; }
             cur=de.ino;
         }
+        if(!stopped) return -EFSCORRUPT;
     }
     uint32_t replaced_ino=UINT32_MAX; uint8_t replaced_type=0;
     if(r==0){
@@ -535,6 +574,8 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
         struct dinode pd; fs_iget(f,dpar,&pd);
         struct dentry de;
         if(dir_scan(f,&pd,dpar,dlast,NULL,&de)) return -EFSCORRUPT;
+        if(sd.type!=T_DIR && de.type==T_DIR) return -EISDIR;
+        if(sd.type==T_DIR && de.type!=T_DIR) return -ENOTDIR;
         if(de.type==T_DIR){
             struct dinode dd; fs_iget(f,de.ino,&dd);
             for(uint64_t off=0; off<dd.size; off+=128){
@@ -571,7 +612,12 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     }
     if(replaced_ino!=UINT32_MAX){
         struct dinode rd; fs_iget(f,replaced_ino,&rd);
-        if(replaced_type==T_DIR){ rd.nlink-=2; free_blocks(f,&rd,0); ifree(f,replaced_ino); }
+        if(replaced_type==T_DIR){
+            rd.nlink-=2; free_blocks(f,&rd,0); ifree(f,replaced_ino);
+            /* the replaced directory also removed one subdirectory link
+             * from the receiving parent */
+            dpd.nlink--; fs_iput(f,dpar,&dpd);
+        }
         else if(--rd.nlink==0){ free_blocks(f,&rd,0); ifree(f,replaced_ino); }
         else fs_iput(f,replaced_ino,&rd);
     }
@@ -587,16 +633,27 @@ int fs_stat(struct fs *f, uint32_t ino, struct fs_stat *st){
     return 0;
 }
 
-int fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uint32_t *count){
+int fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uint32_t *count, int *truncated){
     struct dinode d; fs_iget(f,ino,&d);
     if(d.type!=T_DIR) return -ENOTDIR;
+    if(truncated) *truncated=0;
     uint32_t n=0;
-    for(uint64_t off=0; off<d.size && n<max; off+=128){
+    uint64_t off=0;
+    for(; off<d.size && n<max; off+=128){
         int err; uint32_t pb=bmap(f,&d,ino,(uint32_t)(off/STRATA_BS),0,&err);
         if(!pb) return -EFSCORRUPT;
         struct dentry *e=(struct dentry*)(blk(f,pb)+(off%STRATA_BS));
         if(e->ino==UINT32_MAX) continue;
         out[n++]=*e;
+    }
+    /* if the caller's buffer filled, say whether entries were left out */
+    if(truncated && off<d.size){
+        for(; off<d.size; off+=128){
+            int err; uint32_t pb=bmap(f,&d,ino,(uint32_t)(off/STRATA_BS),0,&err);
+            if(!pb) return -EFSCORRUPT;
+            struct dentry *e=(struct dentry*)(blk(f,pb)+(off%STRATA_BS));
+            if(e->ino!=UINT32_MAX){ *truncated=1; break; }
+        }
     }
     *count=n;
     return 0;

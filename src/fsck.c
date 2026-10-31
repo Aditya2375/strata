@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 typedef struct {
     int fd, fix, errors, fixed;
@@ -205,14 +206,28 @@ static void count_links(ck *c, uint32_t *refs, uint32_t *subdirs, uint32_t *dotd
     }
 }
 
+/* does /lost+found already contain an entry with this name? */
+static int lnf_has(ck *c, const struct dinode *ld, const char *nm){
+    for(uint64_t off=0; off<ld->size; off+=128){
+        uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
+        if(lb<STRATA_NDIRECT) pb=ld->direct[lb];
+        else if(ld->indirect&&okblk(c,ld->indirect)) pb=((uint32_t*)cblk(c,ld->indirect))[lb-STRATA_NDIRECT];
+        if(!pb||!okblk(c,pb)) continue;
+        struct dentry *e=(struct dentry*)(cblk(c,pb)+(off%STRATA_BS));
+        if(e->ino!=UINT32_MAX && !strncmp(e->name,nm,STRATA_NAMEMAX)) return 1;
+    }
+    return 0;
+}
+
 int fsck(const char *path, int fix, FILE *log){
     ck c; memset(&c,0,sizeof c);
     c.fix=fix; c.log=log; c.fd=open(path,O_RDWR);
     if(c.fd<0){ fprintf(log,"fsck: cannot open %s\n",path); return 1; }
+    struct stat st;
     if(pread(c.fd,&c.sb,sizeof c.sb,0)!=(ssize_t)sizeof c.sb ||
-       c.sb.magic!=STRATA_MAGIC || c.sb.block_size!=STRATA_BS ||
-       c.sb.data_start>=c.sb.nblocks || c.sb.ninodes>STRATA_MAX_INODES){
-        fprintf(log,"fsck: FATAL: bad superblock, cannot proceed\n"); close(c.fd); return 1;
+       fstat(c.fd,&st)!=0 || !S_ISREG(st.st_mode) ||
+       sb_validate(&c.sb,(uint64_t)st.st_size)){
+        fprintf(log,"fsck: FATAL: bad superblock geometry, cannot proceed\n"); close(c.fd); return 1;
     }
     size_t sz=(size_t)c.sb.nblocks*STRATA_BS;
     c.img=malloc(sz);
@@ -251,6 +266,14 @@ int fsck(const char *path, int fix, FILE *log){
             report(&c,1,"orphan inode reattached under /lost+found",i,0);
             if(c.fix){
                 char nm[32]; snprintf(nm,sizeof nm,"ino_%u",i);
+                /* a previous reattach (or a user file) may already hold the
+                 * name; suffix rather than duplicate it and ping-pong */
+                { struct dinode ld0; idata(&c,lnf,&ld0);
+                  if(lnf_has(&c,&ld0,nm)){
+                    int ok=0;
+                    for(char s='a';s<='z'&&!ok;s++){ snprintf(nm,sizeof nm,"ino_%u%c",i,s); ok=!lnf_has(&c,&ld0,nm); }
+                    if(!ok){ fprintf(log,"fsck: FATAL: /lost+found name conflict for orphan ino=%u\n",i); c.errors++; continue; }
+                  } }
                 struct dentry de; memset(&de,0,sizeof de);
                 de.ino=i; idata(&c,i,&ld); de.type=(uint8_t)ld.type;
                 strncpy(de.name,nm,STRATA_NAMEMAX);
@@ -270,7 +293,7 @@ int fsck(const char *path, int fix, FILE *log){
                 if(pb){
                     memcpy(cblk(&c,pb)+(off%STRATA_BS),&de,sizeof de); cwrite(&c,pb);
                     ld.size+=128; iputd(&c,lnf,&ld);
-                } else fprintf(log,"fsck: could not grow /lost+found\n");
+                } else { fprintf(log,"fsck: FATAL: could not grow /lost+found (orphan ino=%u still detached)\n",i); c.errors++; }
             }
             walk_dir(&c,i); /* children become reachable too */
             progress=1;
@@ -342,5 +365,7 @@ int fsck(const char *path, int fix, FILE *log){
 out:
     free(c.img); free(c.used_ino); free(c.reach); free(c.used_blk);
     close(c.fd);
-    return c.errors && !c.fixed ? 1 : 0;
+    /* exit nonzero while any problem remains: FATALs are never counted in
+       fixed, and fixable problems stay unfixed without --fix */
+    return c.errors>c.fixed ? 1 : 0;
 }

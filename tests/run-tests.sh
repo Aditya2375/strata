@@ -67,7 +67,7 @@ diff -u $T/errors.exp $T/errors.out > $T/errors.diff 2>&1 || { echo "FAIL: error
 # --- case: persistence across mounts ---
 img=$T/persist.img
 $BIN format $img 512 256 >/dev/null
-printf '%s\n' 'mkdir -p' 'mkdir /a' 'write /a/data.txt persisted bytes here' 'sync' | $BIN shell $img >/dev/null 2>&1
+printf '%s\n' 'mkdir /a' 'write /a/data.txt persisted bytes here' 'sync' | $BIN shell $img >/dev/null 2>&1
 printf '%s\n' 'cat /a/data.txt' 'append /a/data.txt  +more' 'cat /a/data.txt' | $BIN shell $img > $T/persist.out 2>&1
 printf 'persisted bytes here\npersisted bytes here +more\n' > $T/persist.exp
 diff -u $T/persist.exp $T/persist.out > $T/persist.diff || { echo "FAIL: persistence"; fails=1; } 
@@ -114,6 +114,43 @@ leaf
 E
 run tree $T/tree.exp \
   'mkdir /a' 'mkdir /a/b' 'cd /a/b' 'write leaf x' 'pwd' 'ls' 'cd /' 'pwd' 'cd a/b' 'pwd' 'cd /' 'pwd'
+
+
+# --- case: renaming a dir over an empty dir keeps link counts consistent ---
+img=$T/mvdir.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /d1' 'mkdir /d1/sub' 'mkdir /d2' 'mkdir /d2/sub' 'mv /d1/sub /d2/sub' 'fsck' | $BIN shell $img > $T/mvdir.out 2>&1
+grep -q '^fsck: clean$' $T/mvdir.out && echo "ok: mv dir over dir stays fsck-clean" || { echo "FAIL: mv dir over dir (see $T/mvdir.out)"; fails=1; }
+
+# --- case: cross-type rename rejected ---
+printf 'mv: is a directory\nmv: not a directory\n' > $T/mvx.exp
+run mvx $T/mvx.exp 'write /f x' 'mkdir /dd' 'mv /f /dd' 'mv /dd /f'
+
+# --- case: overlong names rejected, not silently truncated ---
+lname=$(printf 'a%.0s' $(seq 1 130))
+printf 'touch: /%s: name too long\n' "$lname" > $T/long.exp
+run long $T/long.exp "touch /$lname"
+
+# --- case: a 300-deep ".." chain still trips the cycle guard ---
+img=$T/deepmv.img
+$BIN format $img 4096 1024 >/dev/null
+{ echo 'mkdir /dc'; p=/dc; i=0; while [ $i -lt 300 ]; do p=$p/a; echo "mkdir $p"; i=$((i+1)); done; echo "mv /dc $p"; } | $BIN shell $img > $T/deepmv.out 2>&1
+grep -q 'mv: invalid argument' $T/deepmv.out && echo "ok: 300-deep mv cycle rejected" || { echo "FAIL: deep mv cycle (see $T/deepmv.out)"; fails=1; }
+
+# --- case: corrupt superblock geometry is refused, not OOB-read ---
+img=$T/corrupt.img
+$BIN format $img 512 256 >/dev/null
+printf '\xff\xff\xff\xff' | dd of=$img bs=1 seek=8 count=4 conv=notrunc 2>/dev/null  # nblocks = 4 billion
+if $BIN fsck $img > $T/corrupt-fsck.out 2>&1; then echo "FAIL: fsck accepted corrupt geometry"; fails=1; fi
+grep -q 'FATAL: bad superblock geometry' $T/corrupt-fsck.out && echo "ok: corrupt geometry refused by fsck" || { echo "FAIL: fsck geometry message"; fails=1; }
+printf '%s\n' 'ls' | $BIN shell $img > $T/corrupt-shell.out 2>&1
+grep -q 'cannot mount' $T/corrupt-shell.out && echo "ok: corrupt geometry refused at mount" || { echo "FAIL: mount accepted corrupt geometry"; fails=1; }
+
+# --- case: fsck exits nonzero while a FATAL remains ---
+img=$T/fatal.img
+$BIN format $img 512 256 >/dev/null
+printf '\x00\x00\x00\x00' | dd of=$img bs=1 seek=0 count=4 conv=notrunc 2>/dev/null  # magic = 0
+if $BIN fsck $img --fix > /dev/null 2>&1; then echo "FAIL: fsck --fix exited 0 with a FATAL"; fails=1; else echo "ok: fsck --fix exits nonzero while a FATAL remains"; fi
 
 echo "--- unit tests ---"
 $UNIT || fails=1

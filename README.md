@@ -43,7 +43,7 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
 
 `./tests/run-tests.sh` runs:
 
-- **3,195 unit checks** (allocator cycles, a 2 MiB file crossing into
+- **3,520 unit checks** (allocator cycles, a 2 MiB file crossing into
   indirect blocks with byte-exact read-back, partial block-boundary
   writes, truncation, tombstone reuse, deep nesting, ENOSPC fill)
 - scripted shell cases: basic ops, error paths, persistence across

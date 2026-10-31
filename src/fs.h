@@ -64,6 +64,7 @@ struct fs_stat {
 void  fs_iget(struct fs *f, uint32_t ino, struct dinode *out);
 void  fs_iput(struct fs *f, uint32_t ino, const struct dinode *in);
 int   mkfs(const char *path, uint32_t nblocks, uint32_t ninodes);
+int   sb_validate(const struct superblock *sb, uint64_t file_bytes);
 int   fs_mount(struct fs *f, const char *path);
 int   fs_sync(struct fs *f);
 void  fs_unmount(struct fs *f);
@@ -78,7 +79,7 @@ int   fs_rmdir(struct fs *f, uint32_t cwd, const char *path);
 int   fs_link(struct fs *f, uint32_t cwd, const char *src, const char *dst);
 int   fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst);
 int   fs_stat(struct fs *f, uint32_t ino, struct fs_stat *st);
-int   fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uint32_t *count);
+int   fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uint32_t *count, int *truncated);
 int   fsck(const char *path, int fix, FILE *log);
 uint64_t fs_maxfile(void);
 #endif

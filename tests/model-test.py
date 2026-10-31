@@ -50,6 +50,7 @@ class M:
         if b in self.t and self.t[a][0] == 'f' and self.t[b][0] == 'f' and self.t[a][1] == self.t[b][1]:
             return  # rename(2): hard links to the same file - success, no-op
         if b in self.t:
+            if self.t[a][0] != self.t[b][0]: return  # rename(2): file<->dir rejected (EISDIR/ENOTDIR)
             if self.t[b][0] == 'd':
                 if any(q.startswith(b + '/') for q in self.t if q != b): return
                 for q in [q for q in self.t if q.startswith(b + '/')]:

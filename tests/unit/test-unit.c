@@ -84,8 +84,59 @@ int main(void){
     }
     uint32_t dino; OK(fs_resolve(&f,0,"/d",&dino)==0);
     struct dentry ents[64]; uint32_t cnt;
-    OK(fs_readdir(&f,dino,ents,64,&cnt)==0);
+    OK(fs_readdir(&f,dino,ents,64,&cnt,NULL)==0);
     OK(cnt<=19); /* . .. plus at most 17 live names */
+
+    /* readdir truncation is reported, not silent */
+    int trunc=0; uint32_t cnt2=0;
+    OK(fs_readdir(&f,dino,ents,2,&cnt2,&trunc)==0);
+    OK(cnt2==2 && trunc==1);
+    OK(fs_readdir(&f,dino,ents,64,&cnt2,&trunc)==0);
+    OK(trunc==0);
+
+    /* overlong path components are rejected, not truncated */
+    char longname[160]; memset(longname,'a',sizeof longname-1); longname[0]='/'; longname[sizeof longname-1]=0;
+    OK(fs_create(&f,0,longname,T_FILE,NULL)==-ENAMETOOLONG);
+
+    /* cross-type rename: file over dir is EISDIR, dir over file ENOTDIR */
+    OK(fs_create(&f,0,"/rt_file",T_FILE,NULL)==0);
+    OK(fs_mkdir(&f,0,"/rt_dir")==0);
+    OK(fs_rename(&f,0,"/rt_file","/rt_dir")==-EISDIR);
+    OK(fs_rename(&f,0,"/rt_dir","/rt_file")==-ENOTDIR);
+
+    /* renaming a dir over an empty dir keeps the parent's link count */
+    OK(fs_mkdir(&f,0,"/n1")==0);
+    OK(fs_mkdir(&f,0,"/n1/sub")==0);
+    OK(fs_mkdir(&f,0,"/n2")==0);
+    OK(fs_mkdir(&f,0,"/n2/sub")==0);
+    uint32_t n2; OK(fs_resolve(&f,0,"/n2",&n2)==0);
+    struct fs_stat nst; OK(fs_stat(&f,n2,&nst)==0);
+    uint32_t want_links=nst.nlink;
+    OK(fs_rename(&f,0,"/n1/sub","/n2/sub")==0);
+    OK(fs_stat(&f,n2,&nst)==0 && nst.nlink==want_links);
+
+    /* a 300-deep ".." chain: moving the top dir into it must be rejected
+       (the old 256-hop cap would have missed the cycle) */
+    OK(fs_mkdir(&f,0,"/dc")==0);
+    char dp[700]; strcpy(dp,"/dc");
+    for(int i=0;i<300;i++){ strcat(dp,"/a"); OK(fs_mkdir(&f,0,dp)==0); }
+    OK(fs_rename(&f,0,"/dc",dp)==-EINVAL);
+
+    /* superblock geometry validation */
+    struct superblock good=f.sb;
+    OK(sb_validate(&good,(uint64_t)f.sb.nblocks*STRATA_BS)==0);
+    struct superblock bad;
+    bad=good; bad.nblocks=0xFFFFFFFFu;
+    OK(sb_validate(&bad,(uint64_t)good.nblocks*STRATA_BS)==-EFSCORRUPT); /* 16TB claim vs real file size */
+    bad=good; bad.itable_start=bad.data_start;
+    OK(sb_validate(&bad,(uint64_t)good.nblocks*STRATA_BS)==-EFSCORRUPT); /* overlapping regions */
+    bad=good; bad.dbmap_start=bad.ibmap_start;
+    OK(sb_validate(&bad,(uint64_t)good.nblocks*STRATA_BS)==-EFSCORRUPT);
+    bad=good; bad.root_ino=good.ninodes;
+    OK(sb_validate(&bad,(uint64_t)good.nblocks*STRATA_BS)==-EFSCORRUPT); /* root out of range */
+    bad=good; bad.itable_blocks=1;
+    OK(sb_validate(&bad,(uint64_t)good.nblocks*STRATA_BS)==-EFSCORRUPT); /* itable too small for ninodes */
+
 
     /* deep nesting + relative resolution */
     uint32_t cwd=0;

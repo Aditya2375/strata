@@ -25,6 +25,7 @@ static const char *ename(int e){
     case ENOSPC: return "no space left on device";
     case EFBIG: return "file too large";
     case ENAMETOOLONG: return "name too long";
+    case EBUSY: return "device or resource busy";
     case EPERM: return "operation not permitted";
     case EINVAL: return "invalid argument";
     case EFSCORRUPT: return "filesystem corrupted";
@@ -41,12 +42,12 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
         struct dinode d; fs_iget(f,cur,&d);
         if(d.type!=T_DIR) break;
         struct dentry ents[256]; uint32_t cnt;
-        fs_readdir(f,cur,ents,256,&cnt);
+        fs_readdir(f,cur,ents,256,&cnt,NULL);
         uint32_t par=UINT32_MAX;
         for(uint32_t i=0;i<cnt;i++) if(!strcmp(ents[i].name,"..")) par=ents[i].ino;
         if(par==UINT32_MAX) break;
         struct dentry pe[512]; uint32_t pc;
-        fs_readdir(f,par,pe,512,&pc);
+        fs_readdir(f,par,pe,512,&pc,NULL);
         int found=0;
         for(uint32_t i=0;i<pc;i++)
             if(pe[i].ino==cur && strcmp(pe[i].name,".") && strcmp(pe[i].name,"..")){
@@ -83,8 +84,9 @@ static int cmd_ls(char *arg){
         else printf("%s\n",strrchr(path,'/')?strrchr(path,'/')+1:path);
         return 0;
     }
-    struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt;
-    if(fs_readdir(&F,ino,ents,4096,&cnt)){ free(ents); printf("ls: read error\n"); return 1; }
+    struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
+    if(fs_readdir(&F,ino,ents,4096,&cnt,&trunc)){ free(ents); printf("ls: read error\n"); return 1; }
+    if(trunc) printf("ls: (listing truncated at %u entries)\n",cnt);
     /* sort by name for stable output */
     for(uint32_t i=1;i<cnt;i++){
         struct dentry k=ents[i]; int j=(int)i-1;
@@ -115,17 +117,18 @@ static int one_cmd(char *line){
     if(rest) rest+=strspn(rest," \t");
     if(!strcmp(cmd,"dump")){
         /* deterministic full-tree dump: "F path size fnv1a64" / "D path" */
-        char stack[128][600]; uint32_t istack[128]; int top=0;
+        char stack[512][1152]; uint32_t istack[512]; int top=0;
         strcpy(stack[0],"/"); istack[0]=CWD==UINT32_MAX?F.sb.root_ino:F.sb.root_ino;
         while(top>=0){
-            char dir[600]; strcpy(dir,stack[top]);
+            char dir[1152]; strcpy(dir,stack[top]);
             uint32_t ino=istack[top--];
-            struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt;
-            if(fs_readdir(&F,ino,ents,4096,&cnt)){ free(ents); continue; }
+            struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
+            if(fs_readdir(&F,ino,ents,4096,&cnt,&trunc)){ free(ents); continue; }
+            if(trunc) fprintf(stderr,"dump: %s: listing truncated at 4096 entries\n",dir);
             for(uint32_t i=1;i<cnt;i++){ struct dentry k=ents[i]; int j=(int)i-1; while(j>=0&&strcmp(ents[j].name,k.name)>0){ents[j+1]=ents[j];j--;} ents[j+1]=k; }
             for(uint32_t i=0;i<cnt;i++){
                 if(!strcmp(ents[i].name,".")||!strcmp(ents[i].name,"..")) continue;
-                char p[600];
+                char p[1152];
                 size_t dl=strlen(dir);
                 memcpy(p,dir,dl);
                 if(dir[1]) p[dl++]='/';
@@ -133,7 +136,8 @@ static int one_cmd(char *line){
                 p[sizeof p-1]=0;
                 if(ents[i].type==T_DIR){
                     printf("D %s\n",p);
-                    if(top<126){ strcpy(stack[++top],p); istack[top]=ents[i].ino; }
+                    if(top<510){ strcpy(stack[++top],p); istack[top]=ents[i].ino; }
+                    else fprintf(stderr,"dump: %s: tree too deep, subtree skipped\n",p);
                 } else {
                     struct fs_stat st; fs_stat(&F,ents[i].ino,&st);
                     uint64_t h=1469598103934665603ULL;
