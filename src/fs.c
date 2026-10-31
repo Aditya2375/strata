@@ -67,6 +67,7 @@ static uint32_t ialloc(struct fs *f, uint16_t type){
     return UINT32_MAX;
 }
 static void ifree(struct fs *f, uint32_t i){
+    if(i>=f->sb.ninodes) return; /* corrupt pointer: never clear a bit outside the inode map */
     if(!bit_get(ibmap(f),i)) return;
     bit_clr(ibmap(f),i);
     touch(f,f->sb.ibmap_start + (i/8)/STRATA_BS);
@@ -89,6 +90,7 @@ void fs_iget(struct fs *f, uint32_t ino, struct dinode *out){
     out->indirect=g32(p+36+STRATA_NDIRECT*4);
 }
 void fs_iput(struct fs *f, uint32_t ino, const struct dinode *in){
+    if(ino>=f->sb.ninodes) return; /* corrupt pointer: never write outside the inode table */
     uint64_t off=(uint64_t)f->sb.itable_start*STRATA_BS + (uint64_t)ino*128;
     uint8_t *p=f->img+off;
     p16(p,in->type); p16(p+2,in->mode);
@@ -157,6 +159,7 @@ static void free_blocks(struct fs *f, struct dinode *ip, uint64_t keep_lbs){
 /* ---- mount / sync ---- */
 int mkfs(const char *path, uint32_t nblocks, uint32_t ninodes){
     if(ninodes<64||ninodes>STRATA_MAX_INODES) return -1;
+    if(nblocks==0||nblocks>STRATA_MAX_BLOCKS) return -1; /* match the mount-side cap */
     if(ninodes%32) ninodes=(ninodes+31)&~31u;
     uint32_t itable_blocks=(ninodes*128 + STRATA_BS-1)/STRATA_BS;
     uint32_t ibmap_blocks=(ninodes/8 + STRATA_BS-1)/STRATA_BS;
@@ -287,6 +290,9 @@ static int dir_scan(struct fs *f, struct dinode *dp, uint32_t dino,
         struct dentry *de=(struct dentry*)(blk(f,pb)+(off%STRATA_BS));
         if(de->ino==UINT32_MAX) continue; /* removed marker */
         if(name && strncmp(de->name,name,STRATA_NAMEMAX+1)==0){
+            /* a hostile image can point a dentry outside the inode table;
+               never hand that ino to fs_iget/fs_iput/ifree */
+            if(de->ino >= f->sb.ninodes) return -EFSCORRUPT;
             if(ent_off) *ent_off=(uint32_t)off;
             if(out) *out=*de;
             return 0;
@@ -406,8 +412,12 @@ int fs_create(struct fs *f, uint32_t cwd, const char *path, uint16_t type, uint3
 int fs_read(struct fs *f, uint32_t ino, uint64_t off, void *buf, uint64_t n, uint64_t *got){
     struct dinode d; fs_iget(f,ino,&d);
     if(d.type!=T_FILE && d.type!=T_DIR) return -EINVAL;
-    if(off>=d.size){ *got=0; return 0; }
-    if(off+n>d.size) n=d.size-off;
+    /* a hostile image can carry a size far past the single-indirect limit;
+       clamp to the real maximum or reads stream sparse zeros for days */
+    uint64_t sz=d.size, mx=fs_maxfile();
+    if(sz>mx) sz=mx;
+    if(off>=sz){ *got=0; return 0; }
+    if(off+n>sz) n=sz-off;
     uint8_t *dst=buf; uint64_t done=0;
     while(done<n){
         uint64_t pos=off+done;

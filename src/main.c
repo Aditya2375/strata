@@ -118,7 +118,11 @@ static int one_cmd(char *line){
     if(!strcmp(cmd,"dump")){
         /* deterministic full-tree dump: "F path size fnv1a64" / "D path" */
         char stack[512][1152]; uint32_t istack[512]; int top=0;
-        strcpy(stack[0],"/"); istack[0]=CWD==UINT32_MAX?F.sb.root_ino:F.sb.root_ino;
+        /* a corrupt image can turn the tree into a cyclic graph: never
+         * descend into a directory inode twice */
+        uint8_t *dseen=calloc(F.sb.ninodes,1);
+        strcpy(stack[0],"/"); istack[0]=F.sb.root_ino;
+        if(dseen) dseen[F.sb.root_ino]=1;
         while(top>=0){
             char dir[1152]; strcpy(dir,stack[top]);
             uint32_t ino=istack[top--];
@@ -143,7 +147,9 @@ static int one_cmd(char *line){
                 memcpy(p+dl,ents[i].name,nl+1);
                 if(ents[i].type==T_DIR){
                     printf("D %s\n",p);
-                    if(top<510){ strcpy(stack[++top],p); istack[top]=ents[i].ino; }
+                    if(ents[i].ino<F.sb.ninodes && dseen && dseen[ents[i].ino])
+                        fprintf(stderr,"dump: %s: directory cycle, subtree skipped\n",p);
+                    else if(top<510){ strcpy(stack[++top],p); istack[top]=ents[i].ino; if(dseen&&ents[i].ino<F.sb.ninodes) dseen[ents[i].ino]=1; }
                     else fprintf(stderr,"dump: %s: tree too deep, subtree skipped\n",p);
                 } else {
                     struct fs_stat st; fs_stat(&F,ents[i].ino,&st);
@@ -158,6 +164,7 @@ static int one_cmd(char *line){
             }
             free(ents);
         }
+        free(dseen);
         return 0;
     }
     if(!strcmp(cmd,"help")){
@@ -198,7 +205,8 @@ static int one_cmd(char *line){
         if(!strcmp(cmd,"stat")){
             uint32_t ino; int r=fs_resolve(&F,CWD,rest,&ino);
             if(r){ printf("stat: %s: %s\n",rest,ename(-r)); return 1; }
-            struct fs_stat st; fs_stat(&F,ino,&st);
+            struct fs_stat st;
+            if((r=fs_stat(&F,ino,&st))){ printf("stat: %s: %s\n",rest,ename(-r)); return 1; }
             printf("type=%s size=%llu blocks=%u links=%u mode=%o\n",
                    st.type==T_DIR?"dir":"file",(unsigned long long)st.size,
                    st.blocks,st.nlink,st.mode);

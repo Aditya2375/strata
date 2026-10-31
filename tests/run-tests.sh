@@ -406,4 +406,191 @@ print('fuzz: 300 random sessions, no crashes')
 PY
 [ $? -eq 0 ] || fails=1
 
+
+echo "--- round-3 regressions ---"
+
+# shared crafting helper for the hostile images below
+cat > $T/r3.py <<'R3PY'
+import sys, struct as s
+BS=4096
+def geometry(d):
+    d.seek(0); b=d.read(BS)
+    return dict(nin=s.unpack_from('<I',b,12)[0], ibm=s.unpack_from('<I',b,16)[0],
+                dbm=s.unpack_from('<I',b,24)[0], it=s.unpack_from('<I',b,32)[0],
+                data=s.unpack_from('<I',b,40)[0], root=s.unpack_from('<I',b,52)[0],
+                lnf=s.unpack_from('<I',b,56)[0])
+def find(d, g, dino, name):
+    d.seek(g['it']*BS+dino*128); ino=d.read(128)
+    sz=s.unpack_from('<Q',ino,16)[0]
+    for off in range(0,sz,128):
+        lb=off//BS
+        if lb<12: pb=s.unpack_from('<I',ino,36+4*lb)[0]
+        else:
+            ind=s.unpack_from('<I',ino,36+4*12)[0]
+            if not ind: return None
+            d.seek(ind*BS); tab=d.read(BS); pb=s.unpack_from('<I',tab,4*(lb-12))[0]
+        if not pb: return None
+        d.seek(pb*BS+off%BS); e=d.read(128)
+        if s.unpack_from('<I',e,0)[0]!=0xFFFFFFFF and e[8:8+120].split(b'\0')[0].decode(errors='replace')==name:
+            return pb, off%BS, e
+    return None
+def set_size(d, g, ino, val):
+    d.seek(g['it']*BS+ino*128+16); d.write(s.pack('<Q',val))
+R3PY
+
+# N1: a dentry pointing outside the inode table must be rejected, never
+# dereferenced (was: SEGV / silent clobber of a victim file's bytes)
+img=$T/r3n1.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'write /a/f data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+pb,off,e=find(d,g,aino,'f')
+d.seek(pb*BS+off); d.write(s.pack('<I',352))   # past ninodes=256, lands in data blocks
+d.close()
+R3PY
+out=$(printf '%s\n' 'rm /a/f' 'ln /a/f /a/g' | $BIN shell $img 2>&1)
+case "$out" in
+  *"filesystem corrupted"*"filesystem corrupted"*) echo "ok: out-of-table dentry rejected (rm+ln)";;
+  *) echo "FAIL: N1 [$out]"; fails=1;;
+esac
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+pb,off,e=find(d,g,aino,'f')
+d.seek(pb*BS+off); d.write(s.pack('<I',0x00FFFFFF))
+d.close()
+R3PY
+out=$(printf '%s\n' 'rm /a/f' | $BIN shell $img 2>&1)
+case "$out" in
+  *"filesystem corrupted"*) echo "ok: huge dentry ino rejected";;
+  *) echo "FAIL: N1 huge [$out]"; fails=1;;
+esac
+
+# N5: inode size past the single-indirect maximum is flagged and truncated;
+# reads stop at the real maximum instead of streaming zeros without end
+img=$T/r3n5.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /g hello' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'g'); gino=s.unpack_from('<I',e,0)[0]
+set_size(d,g,gino,1<<40)
+d.close()
+R3PY
+if $BIN fsck $img --fix 2>&1 | grep -q "truncated" && $BIN fsck $img 2>&1 | grep -q clean; then
+  echo "ok: oversized inode flagged and truncated"
+else echo "FAIL: N5 fsck"; fails=1; fi
+n=$(printf 'cat /g\n' | $BIN shell $img 2>/dev/null | wc -c)
+[ "$n" -le 4243457 ] && echo "ok: reads bounded at the maximum file size" || { echo "FAIL: N5 read ran away ($n bytes)"; fails=1; }
+
+# N2: a directory with a huge corrupt size must not hang fsck, and the
+# repair must converge
+img=$T/r3n2.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'write /a/f x' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+set_size(d,g,aino,1<<40)
+d.close()
+R3PY
+timeout 30 $BIN fsck $img --fix >/dev/null 2>&1
+if $BIN fsck $img 2>&1 | grep -q clean; then echo "ok: huge dir size repaired, fsck converges"
+else echo "FAIL: N2"; $BIN fsck $img 2>&1 | tail -3; fails=1; fi
+
+# N3: shell dump on a directory cycle terminates with a warning
+img=$T/r3n3.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /x' 'mkdir /x/y' 'write /x/f data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'x'); xino=s.unpack_from('<I',e,0)[0]
+pb,off,e=find(d,g,xino,'y')
+d.seek(pb*BS+off); d.write(s.pack('<I',xino))   # /x/y points back at /x
+d.close()
+R3PY
+out=$(timeout 20 sh -c "printf 'dump\n' | $BIN shell $img 2>&1")
+case "$out" in
+  *"directory cycle"*) echo "ok: dump survives a directory cycle";;
+  *) echo "FAIL: N3 [$(echo "$out" | tail -2)]"; fails=1;;
+esac
+
+# N4: a bogus FILE-type "lost+found" in the root's indirect region is
+# tombstoned, not duplicated; fsck converges without leaking an inode
+img=$T/r3n4.img
+$BIN format $img 8192 1024 >/dev/null
+{ i=0; while [ $i -lt 400 ]; do echo "write /f$i x"; i=$((i+1)); done; echo sync; } | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+r=find(d,g,g['root'],'lost+found'); pb,off,e=r
+d.seek(pb*BS+off); d.write(s.pack('<I',0xFFFFFFFF))   # tombstone the real one
+d.seek(g['it']*BS+g['root']*128); ino=d.read(128)
+sz=s.unpack_from('<Q',ino,16)[0]; assert sz>=401*128
+ind=s.unpack_from('<I',ino,36+4*12)[0]; assert ind
+d.seek(ind*BS); tab=d.read(BS); pb12=s.unpack_from('<I',tab,0)[0]
+slot=400-384
+d.seek(pb12*BS+slot*128); e=d.read(128)
+de=bytearray(128); s.pack_into('<I',de,0,s.unpack_from('<I',e,0)[0]); de[4]=2
+nm=b'lost+found'; de[8:8+len(nm)]=nm
+d.seek(pb12*BS+slot*128); d.write(bytes(de))
+d.close()
+R3PY
+$BIN fsck $img --fix >/dev/null 2>&1
+$BIN fsck $img --fix >/dev/null 2>&1
+freei=$(python3 -c "
+import struct as s
+d=open('$img','rb'); d.seek(44); print(s.unpack('<I',d.read(4))[0])")
+if $BIN fsck $img 2>&1 | grep -q clean && [ "$freei" = "621" ]; then
+  echo "ok: bogus lost+found tombstoned, converged, no inode leak"
+else echo "FAIL: N4 (free_inodes=$freei)"; $BIN fsck $img 2>&1 | tail -3; fails=1; fi
+
+# N6: mkfs refuses an image beyond the mount-side block cap
+if $BIN format $T/r3n6.img 300000 256 >/dev/null 2>&1 || [ -e $T/r3n6.img ]; then
+  echo "FAIL: N6 oversized mkfs accepted"; fails=1
+else echo "ok: oversized mkfs refused up front"; fi
+
+# N7: stat on a dangling entry reports the error instead of zeros
+img=$T/r3n7.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a')
+d.seek(pb*BS+off); d.write(s.pack('<I',100))   # ino 100 is free
+d.close()
+R3PY
+out=$(printf 'stat /a\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"no such file"*) echo "ok: stat on a dangling entry errors";;
+  *) echo "FAIL: N7 [$out]"; fails=1;;
+esac
+
+# N8: no-fix fsck says what it WOULD do, not what it did
+img=$T/r3n8.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R3PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+d.seek(g['it']*BS+100*128); d.write(bytes([2,0]))
+d.seek(g['it']*BS+100*128+12); d.write(bytes([1,0,0,0]))
+d.seek(g['ibm']*BS); bm=bytearray(d.read(BS)); bm[100//8]|=(1<<(100%8))
+d.seek(g['ibm']*BS); d.write(bm)
+d.close()
+R3PY
+out=$($BIN fsck $img 2>&1)
+case "$out" in
+  *"would be reattached"*) echo "ok: no-fix fsck speaks conditionally";;
+  *) echo "FAIL: N8 [$out]"; fails=1;;
+esac
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

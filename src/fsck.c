@@ -115,7 +115,15 @@ static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t 
         uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
         if(lb<STRATA_NDIRECT) pb=d.direct[lb];
         else if(d.indirect && okblk(c,d.indirect)) pb=((uint32_t*)cblk(c,d.indirect))[lb-STRATA_NDIRECT];
-        if(!okblk(c,pb)){ report(c,0,"directory has unusable data block",ino,pb); return; }
+        if(!okblk(c,pb)){
+            /* strata directories are dense: an unmapped block means every
+             * entry past this point is garbage. Truncate the size to the
+             * entry boundary so the repair converges instead of reporting
+             * the same FATAL on every run. */
+            report(c,1,"directory size truncated at first unmapped block",ino,pb);
+            if(c->fix){ d.size=off; iputd(c,ino,&d); }
+            return;
+        }
         struct dentry *e=(struct dentry*)(cblk(c,pb)+(off%STRATA_BS));
         if(e->ino==UINT32_MAX) continue;
         int bad=0;
@@ -222,7 +230,7 @@ static void count_links(ck *c, uint32_t *refs, uint32_t *subdirs, uint32_t *dotd
             uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
             if(lb<STRATA_NDIRECT) pb=d.direct[lb];
             else if(d.indirect && okblk(c,d.indirect)) pb=((uint32_t*)cblk(c,d.indirect))[lb-STRATA_NDIRECT];
-            if(!okblk(c,pb)) continue;
+            if(!okblk(c,pb)) break; /* strata dirs are dense: first unmapped block is the end */
             struct dentry *e=(struct dentry*)(cblk(c,pb)+(off%STRATA_BS));
             if(e->ino==UINT32_MAX||e->ino>=c->sb.ninodes) continue;
             if(!strcmp(e->name,".")||!strcmp(e->name,"..")){
@@ -314,11 +322,22 @@ static uint32_t recreate_lnf(ck *c){
     struct dinode rd; idata(c,c->sb.root_ino,&rd);
     int linked=0;
     for(uint64_t off=0; off<rd.size && !linked; off+=128){
-        uint32_t lb=(uint32_t)(off/STRATA_BS);
-        uint32_t rpb= lb<STRATA_NDIRECT ? rd.direct[lb] : 0;
-        if(!rpb) break;
+        uint32_t lb=(uint32_t)(off/STRATA_BS), rpb=0;
+        if(lb<STRATA_NDIRECT) rpb=rd.direct[lb];
+        else if(rd.indirect && okblk(c,rd.indirect)) rpb=((uint32_t*)cblk(c,rd.indirect))[lb-STRATA_NDIRECT];
+        if(!okblk(c,rpb)) break;
         struct dentry *e=(struct dentry*)(cblk(c,rpb)+(off%STRATA_BS));
-        if(e->ino!=UINT32_MAX && !strncmp(e->name,"lost+found",STRATA_NAMEMAX+1)){
+        if(e->ino==UINT32_MAX) continue;
+        if(!strncmp(e->name,"lost+found",STRATA_NAMEMAX+1)){
+            /* a "lost+found" that is not a directory is corruption, not a
+             * slot to resurrect: tombstone it and keep scanning, or the
+             * next run would duplicate the name and never converge */
+            struct dinode te; memset(&te,0,sizeof te);
+            if(e->ino<c->sb.ninodes) idata(c,e->ino,&te);
+            if(e->type!=T_DIR || te.type!=T_DIR){
+                e->ino=UINT32_MAX; cwrite(c,rpb);
+                continue;
+            }
             e->ino=nino; e->type=T_DIR; cwrite(c,rpb); linked=1;
         }
     }
@@ -341,7 +360,7 @@ static int lnf_has(ck *c, const struct dinode *ld, const char *nm){
         uint32_t lb=(uint32_t)(off/STRATA_BS), pb=0;
         if(lb<STRATA_NDIRECT) pb=ld->direct[lb];
         else if(ld->indirect&&okblk(c,ld->indirect)) pb=((uint32_t*)cblk(c,ld->indirect))[lb-STRATA_NDIRECT];
-        if(!pb||!okblk(c,pb)) continue;
+        if(!pb||!okblk(c,pb)) break; /* dense directory: unmapped block ends the scan */
         struct dentry *e=(struct dentry*)(cblk(c,pb)+(off%STRATA_BS));
         if(e->ino!=UINT32_MAX && !strncmp(e->name,nm,STRATA_NAMEMAX)) return 1;
     }
@@ -384,7 +403,13 @@ int fsck(const char *path, int fix, FILE *log){
         int used=(d.type!=T_FREE), bit=cbit(ib,i);
         if(used && !bit){ report(&c,1,"inode marked free but in use",i,0); csbit(ib,i); cwrite(&c,c.sb.ibmap_start+(i/8)/STRATA_BS); }
         if(!used && bit){ report(&c,1,"inode bitmap set for free inode",i,0); ccbit(ib,i); cwrite(&c,c.sb.ibmap_start+(i/8)/STRATA_BS); }
-        if(used){ c.used_ino[i]=1; mark_ino_blocks(&c,i,&d); }
+        if(used){
+            if(d.size>fs_maxfile()){
+                report(&c,1,"size beyond the maximum file size: truncated",i,(uint32_t)(d.size/STRATA_BS));
+                d.size=fs_maxfile(); iputd(&c,i,&d);
+            }
+            c.used_ino[i]=1; mark_ino_blocks(&c,i,&d);
+        }
     }
 
     /* pass 2: reachability from root */
@@ -429,7 +454,8 @@ int fsck(const char *path, int fix, FILE *log){
                     c.errors++; continue;
                 }
             }
-            report(&c,1,"orphan inode reattached under /lost+found",i,0);
+            report(&c,1,c.fix?"orphan inode reattached under /lost+found"
+                              :"orphan inode would be reattached under /lost+found",i,0);
             { struct dinode od; idata(&c,i,&od); if(od.type==T_DIR) c.dir_seen[i]=1; }
             walk_dir(&c,i); /* children become reachable too */
             progress=1;
