@@ -204,6 +204,14 @@ static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t 
         }
         if(dup) continue;
         struct dinode ch; idata(c,e->ino,&ch);
+        /* dentry type vs inode type: a stale entry type survives every
+         * other check here (the inode is fine, the name is fine), but
+         * ls -l trusts the dentry and dump/cat take the wrong branch.
+         * Trust the inode. */
+        if(e->type!=(uint8_t)ch.type){
+            report(c,1,"directory entry type corrected to match its inode",e->ino,pb);
+            e->type=(uint8_t)ch.type; cwrite(c,pb);
+        }
         if(ch.type==T_DIR){
             if(c->dir_seen[e->ino]){
                 /* a second dentry for a directory inode: strata has no
@@ -422,7 +430,10 @@ static int lnf_has(ck *c, const struct dinode *ld, const char *nm){
 
 int fsck(const char *path, int fix, FILE *log){
     ck c; memset(&c,0,sizeof c);
-    c.fix=fix; c.log=log; c.fd=open(path,O_RDWR);
+    c.fix=fix; c.log=log;
+    /* a pure check has no business writing: open read-only so a read-only
+     * image can still be inspected (cwrite already no-ops without fix) */
+    c.fd=open(path,fix?O_RDWR:O_RDONLY);
     if(c.fd<0){ fprintf(log,"fsck: cannot open %s\n",path); return 1; }
     struct stat st;
     if(pread(c.fd,&c.sb,sizeof c.sb,0)!=(ssize_t)sizeof c.sb ||
@@ -521,9 +532,11 @@ int fsck(const char *path, int fix, FILE *log){
         }
     }
 
-    /* pass 3: orphans -> /lost+found */
-    for(int progress=1;progress;){
-        progress=0;
+    /* pass 3: orphans -> /lost+found. One linear pass is enough: a
+     * reattach only ever marks MORE inodes reachable, never fewer, so no
+     * orphan can appear behind the scan position - and a FATAL orphan is
+     * reported exactly once instead of once per restart. */
+    {
         for(uint32_t i=0;i<c.sb.ninodes;i++){
             if(!c.used_ino[i]||c.reach[i]) continue;
             /* find or recreate lost+found */
@@ -564,7 +577,6 @@ int fsck(const char *path, int fix, FILE *log){
                               :"orphan inode would be reattached under /lost+found",i,0);
             { struct dinode od; idata(&c,i,&od); if(od.type==T_DIR) c.dir_seen[i]=1; }
             walk_dir(&c,i); /* children become reachable too */
-            progress=1;
         }
     }
 

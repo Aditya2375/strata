@@ -297,7 +297,6 @@ static int dir_scan(struct fs *f, struct dinode *dp, uint32_t dino,
             if(out) *out=*de;
             return 0;
         }
-        if(!name && out && off/128 < 100000) {} /* unused mode */
     }
     return -ENOENT;
 }
@@ -417,7 +416,8 @@ int fs_read(struct fs *f, uint32_t ino, uint64_t off, void *buf, uint64_t n, uin
     uint64_t sz=d.size, mx=fs_maxfile();
     if(sz>mx) sz=mx;
     if(off>=sz){ *got=0; return 0; }
-    if(off+n>sz) n=sz-off;
+    /* wrap-safe clamp: n can be huge enough that off+n wraps below sz */
+    if(n>sz-off) n=sz-off;
     uint8_t *dst=buf; uint64_t done=0;
     while(done<n){
         uint64_t pos=off+done;
@@ -436,7 +436,9 @@ int fs_read(struct fs *f, uint32_t ino, uint64_t off, void *buf, uint64_t n, uin
 int fs_write(struct fs *f, uint32_t ino, uint64_t off, const void *buf, uint64_t n){
     struct dinode d; fs_iget(f,ino,&d);
     if(d.type!=T_FILE) return d.type==T_DIR?-EISDIR:-EINVAL;
-    if(off+n>fs_maxfile()) return -EFBIG;
+    /* wrap-safe bound: off+n can wrap past uint64 on a hostile size, and
+     * the block index truncation below would then scribble wrong blocks */
+    if(off>fs_maxfile()||n>fs_maxfile()-off) return -EFBIG;
     const uint8_t *src=buf; uint64_t done=0;
     while(done<n){
         uint64_t pos=off+done;
@@ -638,7 +640,18 @@ int fs_rename(struct fs *f, uint32_t cwd, const char *src, const char *dst){
     if(r) return r;
     struct dinode dpd; fs_iget(f,dpar,&dpd);
     r=dir_add(f,&dpd,dpar,dlast,de.ino,de.type);
-    if(r){ dir_add(f,&spd,spar,slast,de.ino,de.type); return r; }
+    if(r){
+        /* Roll back by re-adding the source entry: the tombstone dir_remove
+         * just left in spar guarantees that dir_add fits. The latent dst
+         * case: if dst replaced an existing entry, that entry was already
+         * removed and is NOT restored - but then dpar holds dst's fresh
+         * tombstone and dlast was already a valid name, so absent on-disk
+         * corruption this dir_add cannot fail in that case. The reachable
+         * failures (over-long fresh dst name, or a full image with no
+         * tombstone in dpar) only happen when nothing was replaced, so the
+         * rollback restores the exact pre-call state. */
+        dir_add(f,&spd,spar,slast,de.ino,de.type); return r;
+    }
     if(de.type==T_DIR){
         /* fix ".." when moved across dirs */
         struct dinode md; fs_iget(f,de.ino,&md);

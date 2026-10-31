@@ -188,7 +188,8 @@ static int one_cmd(char *line){
         if(!rest||!*rest){ CWD=F.sb.root_ino; return 0; }
         uint32_t ino; int r=fs_resolve(&F,CWD,rest,&ino);
         if(r){ printf("cd: %s: %s\n",rest,ename(-r)); return 1; }
-        struct fs_stat st; fs_stat(&F,ino,&st);
+        struct fs_stat st;
+        if(fs_stat(&F,ino,&st)){ printf("cd: %s: no such file or directory\n",rest); return 1; }
         if(st.type!=T_DIR){ printf("cd: %s: not a directory\n",rest); return 1; }
         CWD=ino; return 0;
     }
@@ -202,7 +203,8 @@ static int one_cmd(char *line){
         if(!strcmp(cmd,"cat")){
             uint32_t ino; int r=fs_resolve(&F,CWD,rest,&ino);
             if(r){ printf("cat: %s: %s\n",rest,ename(-r)); return 1; }
-            struct fs_stat st; fs_stat(&F,ino,&st);
+            struct fs_stat st;
+            if(fs_stat(&F,ino,&st)){ printf("cat: %s: no such file or directory\n",rest); return 1; }
             if(st.type==T_DIR){ printf("cat: %s: is a directory\n",rest); return 1; }
             char buf[STRATA_BS]; uint64_t off=0, got;
             int last=-1;

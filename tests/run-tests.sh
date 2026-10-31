@@ -858,4 +858,109 @@ R6PY
 done
 echo "ok: indirect self-duplicate zeroed at idx 5, 30, 100, converges"
 
+echo "--- R6b: dentry type vs inode type ---"
+img=$T/r6b1.img
+$BIN format $img 256 128 >/dev/null
+printf 'mkdir /d\ntouch /f\n' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" <<'PY'
+import sys, struct as s
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+it=s.unpack_from('<I',sb,32)[0]; root=s.unpack_from('<I',sb,52)[0]
+d.seek(it*BS+root*128); rino=d.read(128)
+rb=s.unpack_from('<I',rino,36)[0]
+for i in range(32):
+    d.seek(rb*BS+i*128); e=bytearray(d.read(128))
+    if s.unpack_from('<I',e,0)[0]==0xFFFFFFFF: break
+    nm=e[8:8+120].split(b'\0')[0].decode()
+    if nm=='d': e[4]=2; d.seek(rb*BS+i*128); d.write(bytes(e))  # DIR inode, FILE dentry
+    if nm=='f': e[4]=1; d.seek(rb*BS+i*128); d.write(bytes(e))  # FILE inode, DIR dentry
+d.close()
+PY
+out=$($BIN fsck $img 2>&1)
+[ "$(printf '%s\n' "$out" | grep -c 'entry type corrected')" = "2" ] && echo "ok: fsck reports both stale dentry types" || { echo "FAIL: R6b-L1 report [$out]"; fails=1; }
+printf '%s\n' "$out" | grep -q '\[fixed\]' && { echo "FAIL: R6b-L1 no-fix wrote fixes"; fails=1; }
+$BIN fsck $img --fix >/dev/null 2>&1
+$BIN fsck $img 2>&1 | grep -q clean && echo "ok: stale dentry types corrected, converges" || { echo "FAIL: R6b-L1 fix"; fails=1; }
+out=$(printf 'ls -l /\ncat /f\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q '^dir .* d/$' && printf '%s\n' "$out" | grep -q '^file .* f$' && echo "ok: ls -l labels corrected types" || { echo "FAIL: R6b-L1 ls -l [$out]"; fails=1; }
+
+echo "--- R6b: cd/cat on a dangling entry ---"
+img=$T/r6b2.img
+$BIN format $img 256 128 >/dev/null
+printf 'mkdir /gd\ntouch /g\n' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" <<'PY'
+import sys, struct as s
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+it=s.unpack_from('<I',sb,32)[0]; root=s.unpack_from('<I',sb,52)[0]
+d.seek(it*BS+root*128); rino=d.read(128)
+rb=s.unpack_from('<I',rino,36)[0]
+for i in range(32):
+    d.seek(rb*BS+i*128); e=d.read(128)
+    if s.unpack_from('<I',e,0)[0]==0xFFFFFFFF: break
+    nm=e[8:8+120].split(b'\0')[0].decode()
+    if nm in ('g','gd'):
+        ino=s.unpack_from('<I',e,0)[0]
+        d.seek(it*BS+ino*128); d.write(bytes(2))  # inode type = T_FREE, dentry stays
+d.close()
+PY
+out=$(printf 'cat /g\ncd /gd\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'cat: /g: no such file or directory' && printf '%s\n' "$out" | grep -q 'cd: /gd: no such file or directory' && echo "ok: cd/cat error on dangling entries" || { echo "FAIL: R6b-L2 [$out]"; fails=1; }
+$BIN fsck $img --fix >/dev/null 2>&1
+$BIN fsck $img 2>&1 | grep -q clean && echo "ok: dangling entries reaped, converges" || { echo "FAIL: R6b-L2 fsck"; fails=1; }
+
+echo "--- R6b: read-only image, pure check ---"
+img=$T/r6b3.img
+$BIN format $img 256 128 >/dev/null
+printf 'touch /ro\n' | $BIN shell $img >/dev/null 2>&1
+chmod 0444 $img
+out=$($BIN fsck $img 2>&1) && rc=0 || rc=$?
+chmod 0644 $img
+[ "$rc" = "0" ] && printf '%s\n' "$out" | grep -q clean && echo "ok: pure check works on a read-only image" || { echo "FAIL: R6b-L3 rc=$rc [$out]"; fails=1; }
+
+echo "--- R6b: append past a wrapped size ---"
+img=$T/r6b4.img
+$BIN format $img 256 128 >/dev/null
+printf 'touch /h\n' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" <<'PY'
+import sys, struct as s
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+it=s.unpack_from('<I',sb,32)[0]; root=s.unpack_from('<I',sb,52)[0]
+d.seek(it*BS+root*128); rino=d.read(128)
+rb=s.unpack_from('<I',rino,36)[0]
+for i in range(32):
+    d.seek(rb*BS+i*128); e=d.read(128)
+    if s.unpack_from('<I',e,0)[0]==0xFFFFFFFF: break
+    if e[8:8+120].split(b'\0')[0].decode()=='h':
+        ino=s.unpack_from('<I',e,0)[0]
+        d.seek(it*BS+ino*128+16); d.write(s.pack('<Q',0xFFFFFFFFFFFFFFF0))
+d.close()
+PY
+out=$(printf 'append /h XYZZY\nls /\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'append: /h: file too large' && printf '%s\n' "$out" | grep -q '^h$' && echo "ok: wrapped size refused, shell survives" || { echo "FAIL: R6b-c [$out]"; fails=1; }
+$BIN fsck $img --fix >/dev/null 2>&1
+
+echo "--- R6b: multiple orphans, one linear pass ---"
+img=$T/r6b5.img
+$BIN format $img 512 128 >/dev/null
+python3 - "$img" <<'PY'
+import sys, struct as s
+BS=4096
+d=open(sys.argv[1],'r+b'); sb=d.read(BS)
+ibm=s.unpack_from('<I',sb,16)[0]; it=s.unpack_from('<I',sb,32)[0]
+d.seek(ibm*BS); bm=bytearray(d.read(BS))
+for i in (100,101,102):
+    d.seek(it*BS+i*128); d.write(bytes([2,0]))
+    d.seek(it*BS+i*128+12); d.write(s.pack('<I',1))
+    bm[i//8]|=(1<<(i%8))
+d.seek(ibm*BS); d.write(bm); d.close()
+PY
+out=$($BIN fsck $img --fix 2>&1)
+[ "$(printf '%s\n' "$out" | grep -c 'reattached')" = "3" ] && echo "ok: three orphans reattached in one pass" || { echo "FAIL: R6b-b [$out]"; fails=1; }
+$BIN fsck $img 2>&1 | grep -q clean || { echo "FAIL: R6b-b converge"; fails=1; }
+out=$(printf 'ls /lost+found\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'ino_100' && printf '%s\n' "$out" | grep -q 'ino_102' && echo "ok: orphans landed in /lost+found" || { echo "FAIL: R6b-b lnf [$out]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi
