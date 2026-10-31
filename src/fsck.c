@@ -143,6 +143,24 @@ static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t 
         if(!strcmp(e->name,"..")){
             seen_dotdot=1; continue;
         }
+        /* duplicate name check against earlier entries in this dir -
+         * BEFORE marking the target reachable, or a tombstoned duplicate
+         * would keep its inode "reachable" and pass 3 would skip it */
+        int dup=0;
+        for(uint64_t o2=0; o2<off && !dup; o2+=128){
+            uint32_t lb2=(uint32_t)(o2/STRATA_BS), pb2=0;
+            if(lb2<STRATA_NDIRECT) pb2=d.direct[lb2];
+            else if(d.indirect && okblk(c,d.indirect)) pb2=((uint32_t*)cblk(c,d.indirect))[lb2-STRATA_NDIRECT];
+            if(!okblk(c,pb2)) break;
+            struct dentry *e2=(struct dentry*)(cblk(c,pb2)+(o2%STRATA_BS));
+            if(e2->ino==UINT32_MAX) continue;
+            if(!strcmp(e2->name,e->name)){
+                report(c,1,"duplicate directory entry removed",e->ino,pb);
+                e->ino=UINT32_MAX; cwrite(c,pb);
+                dup=1;
+            }
+        }
+        if(dup) continue;
         struct dinode ch; idata(c,e->ino,&ch);
         if(ch.type==T_DIR){
             if(c->dir_seen[e->ino]){
@@ -165,20 +183,6 @@ static void walk_one(ck *c, uint32_t ino, uint32_t **stack, size_t *top, size_t 
             }
         }
         else c->reach[e->ino]=1;
-        /* duplicate name check against earlier entries in this dir */
-        for(uint64_t o2=0; o2<off; o2+=128){
-            uint32_t lb2=(uint32_t)(o2/STRATA_BS), pb2=0;
-            if(lb2<STRATA_NDIRECT) pb2=d.direct[lb2];
-            else if(d.indirect && okblk(c,d.indirect)) pb2=((uint32_t*)cblk(c,d.indirect))[lb2-STRATA_NDIRECT];
-            if(!okblk(c,pb2)) break;
-            struct dentry *e2=(struct dentry*)(cblk(c,pb2)+(o2%STRATA_BS));
-            if(e2->ino==UINT32_MAX) continue;
-            if(!strcmp(e2->name,e->name)){
-                report(c,1,"duplicate directory entry removed",e->ino,pb);
-                e->ino=UINT32_MAX; cwrite(c,pb);
-                break;
-            }
-        }
     }
     (void)seen_dot; (void)seen_dotdot;
 }
@@ -298,8 +302,36 @@ static int dir_append(ck *c, uint32_t dino, struct dinode *dd, const struct dent
  * from the root. Returns the inode, or UINT32_MAX on failure. */
 static uint32_t recreate_lnf(ck *c){
     if(!c->reach[c->sb.root_ino]) return UINT32_MAX;
-    uint32_t nino=c->sb.lnf_ino;
-    if(c->used_ino[nino]) for(nino=0;nino<c->sb.ninodes&&c->used_ino[nino];nino++);
+    /* adopt an existing live lost+found directory when the superblock
+     * pointer is what went bad: allocating a fresh inode would orphan the
+     * real one and take a second fsck run to converge */
+    { struct dinode rd0; idata(c,c->sb.root_ino,&rd0);
+      if(rd0.type==T_DIR){
+        for(uint64_t off=0; off<rd0.size; off+=128){
+            uint32_t lb=(uint32_t)(off/STRATA_BS), rpb=0;
+            if(lb<STRATA_NDIRECT) rpb=rd0.direct[lb];
+            else if(rd0.indirect && okblk(c,rd0.indirect)) rpb=((uint32_t*)cblk(c,rd0.indirect))[lb-STRATA_NDIRECT];
+            if(!okblk(c,rpb)) break;
+            struct dentry *e=(struct dentry*)(cblk(c,rpb)+(off%STRATA_BS));
+            if(e->ino==UINT32_MAX) continue;
+            if(strncmp(e->name,"lost+found",STRATA_NAMEMAX+1)) continue;
+            struct dinode te; memset(&te,0,sizeof te);
+            if(e->ino<c->sb.ninodes) idata(c,e->ino,&te);
+            if(e->type!=T_DIR || te.type!=T_DIR){
+                /* a "lost+found" that is not a directory is corruption, not
+                 * a slot to resurrect: tombstone it and keep scanning, or
+                 * the next run would duplicate the name and never converge */
+                e->ino=UINT32_MAX; cwrite(c,rpb);
+                continue;
+            }
+            c->sb.lnf_ino=e->ino;
+            memcpy(cblk(c,0),&c->sb,sizeof c->sb); cwrite(c,0);
+            c->reach[e->ino]=1; c->dir_seen[e->ino]=1;
+            return e->ino;
+        }
+      } }
+    uint32_t nino=0;
+    for(nino=0;nino<c->sb.ninodes&&c->used_ino[nino];nino++);
     if(nino>=c->sb.ninodes) return UINT32_MAX;
     uint8_t *dbm=cblk(c,c->sb.dbmap_start);
     uint32_t pb=0;
@@ -317,31 +349,10 @@ static uint32_t recreate_lnf(ck *c){
     csbit(c->used_ino,nino);
     uint8_t *ibm=cblk(c,c->sb.ibmap_start);
     csbit(ibm,nino); cwrite(c,c->sb.ibmap_start+(nino/8)/STRATA_BS);
-    /* link it from the root, reusing a dangling "lost+found" entry when
-     * one is there instead of adding a duplicate name */
+    /* link it from the root (any pre-existing lost+found entry was either
+     * adopted above or tombstoned as corruption, so append fresh) */
     struct dinode rd; idata(c,c->sb.root_ino,&rd);
-    int linked=0;
-    for(uint64_t off=0; off<rd.size && !linked; off+=128){
-        uint32_t lb=(uint32_t)(off/STRATA_BS), rpb=0;
-        if(lb<STRATA_NDIRECT) rpb=rd.direct[lb];
-        else if(rd.indirect && okblk(c,rd.indirect)) rpb=((uint32_t*)cblk(c,rd.indirect))[lb-STRATA_NDIRECT];
-        if(!okblk(c,rpb)) break;
-        struct dentry *e=(struct dentry*)(cblk(c,rpb)+(off%STRATA_BS));
-        if(e->ino==UINT32_MAX) continue;
-        if(!strncmp(e->name,"lost+found",STRATA_NAMEMAX+1)){
-            /* a "lost+found" that is not a directory is corruption, not a
-             * slot to resurrect: tombstone it and keep scanning, or the
-             * next run would duplicate the name and never converge */
-            struct dinode te; memset(&te,0,sizeof te);
-            if(e->ino<c->sb.ninodes) idata(c,e->ino,&te);
-            if(e->type!=T_DIR || te.type!=T_DIR){
-                e->ino=UINT32_MAX; cwrite(c,rpb);
-                continue;
-            }
-            e->ino=nino; e->type=T_DIR; cwrite(c,rpb); linked=1;
-        }
-    }
-    if(!linked){
+    {
         struct dentry le; memset(&le,0,sizeof le);
         le.ino=nino; le.type=T_DIR; strncpy(le.name,"lost+found",STRATA_NAMEMAX);
         if(!dir_append(c,c->sb.root_ino,&rd,&le)) return UINT32_MAX;
@@ -373,9 +384,19 @@ int fsck(const char *path, int fix, FILE *log){
     if(c.fd<0){ fprintf(log,"fsck: cannot open %s\n",path); return 1; }
     struct stat st;
     if(pread(c.fd,&c.sb,sizeof c.sb,0)!=(ssize_t)sizeof c.sb ||
-       fstat(c.fd,&st)!=0 || !S_ISREG(st.st_mode) ||
-       sb_validate(&c.sb,(uint64_t)st.st_size)){
+       fstat(c.fd,&st)!=0 || !S_ISREG(st.st_mode)){
         fprintf(log,"fsck: FATAL: bad superblock geometry, cannot proceed\n"); close(c.fd); return 1;
+    }
+    /* an out-of-range lost+found pointer is repairable, not fatal: validate
+     * the rest of the geometry with it masked, then let pass 3 recreate it */
+    { struct superblock sv=c.sb;
+      if(sv.lnf_ino>=sv.ninodes) sv.lnf_ino=sv.root_ino<sv.ninodes?sv.root_ino:0;
+      if(sb_validate(&sv,(uint64_t)st.st_size)){
+        fprintf(log,"fsck: FATAL: bad superblock geometry, cannot proceed\n"); close(c.fd); return 1;
+      } }
+    if(c.sb.lnf_ino>=c.sb.ninodes){
+        report(&c,1,"lost+found pointer out of range, will be recreated",c.sb.lnf_ino,0);
+        c.sb.lnf_ino=UINT32_MAX;
     }
     size_t sz=(size_t)c.sb.nblocks*STRATA_BS;
     c.img=malloc(sz);
@@ -414,7 +435,29 @@ int fsck(const char *path, int fix, FILE *log){
 
     /* pass 2: reachability from root */
     if(c.sb.root_ino>=c.sb.ninodes){ fprintf(log,"fsck: FATAL: root inode out of range\n"); goto out; }
+    { struct dinode rd; idata(&c,c.sb.root_ino,&rd);
+      if(rd.type!=T_DIR){
+        fprintf(log,"fsck: FATAL: root inode is not a directory, image needs manual repair\n");
+        c.errors++; goto out;
+      } }
+    /* the root already has its dentry (it IS one): any later dentry naming
+     * the root inode is a directory hard link, and lnf must be a distinct
+     * directory or pass 3 treats the root as its own lost+found and walks
+     * a real cycle while reporting clean */
+    c.dir_seen[c.sb.root_ino]=1;
     walk_dir(&c,c.sb.root_ino);
+
+    /* a bad lost+found must be repaired even when no orphan needs it this
+     * run, or no-fix and --fix runs would disagree forever */
+    { struct dinode ld; memset(&ld,0,sizeof ld);
+      if(c.sb.lnf_ino<c.sb.ninodes) idata(&c,c.sb.lnf_ino,&ld);
+      if(c.sb.lnf_ino>=c.sb.ninodes || ld.type!=T_DIR || c.sb.lnf_ino==c.sb.root_ino || !c.reach[c.sb.lnf_ino]){
+        report(&c,1,"/lost+found missing or unusable",c.sb.lnf_ino,0);
+        if(c.fix){
+          uint32_t nl=recreate_lnf(&c);
+          if(nl==UINT32_MAX){ fprintf(log,"fsck: FATAL: could not recreate /lost+found\n"); c.errors++; }
+        }
+      } }
 
     /* pass 3: orphans -> /lost+found */
     for(int progress=1;progress;){
@@ -423,8 +466,9 @@ int fsck(const char *path, int fix, FILE *log){
             if(!c.used_ino[i]||c.reach[i]) continue;
             /* find or recreate lost+found */
             uint32_t lnf=c.sb.lnf_ino;
-            struct dinode ld; idata(&c,lnf,&ld);
-            if(!c.reach[lnf]||ld.type!=T_DIR){
+            struct dinode ld; memset(&ld,0,sizeof ld);
+            if(lnf<c.sb.ninodes) idata(&c,lnf,&ld);
+            if(lnf>=c.sb.ninodes||!c.reach[lnf]||ld.type!=T_DIR){
                 if(!c.fix || (lnf=recreate_lnf(&c))==UINT32_MAX){
                     fprintf(log,"fsck: FATAL: /lost+found missing; orphan ino=%u left detached\n",i);
                     c.errors++; continue;

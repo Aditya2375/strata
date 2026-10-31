@@ -41,13 +41,13 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
     while(cur!=f->sb.root_ino && n<64){
         struct dinode d; fs_iget(f,cur,&d);
         if(d.type!=T_DIR) break;
-        struct dentry ents[256]; uint32_t cnt;
-        fs_readdir(f,cur,ents,256,&cnt,NULL);
+        struct dentry ents[256]; uint32_t cnt=0;
+        if(fs_readdir(f,cur,ents,256,&cnt,NULL)) break;
         uint32_t par=UINT32_MAX;
         for(uint32_t i=0;i<cnt;i++) if(!strcmp(ents[i].name,"..")) par=ents[i].ino;
         if(par==UINT32_MAX) break;
-        struct dentry pe[512]; uint32_t pc;
-        fs_readdir(f,par,pe,512,&pc,NULL);
+        struct dentry pe[512]; uint32_t pc=0;
+        if(fs_readdir(f,par,pe,512,&pc,NULL)) break;
         int found=0;
         for(uint32_t i=0;i<pc;i++)
             if(pe[i].ino==cur && strcmp(pe[i].name,".") && strcmp(pe[i].name,"..")){
@@ -80,8 +80,8 @@ static int cmd_ls(char *arg){
     struct fs_stat st;
     if(fs_stat(&F,ino,&st)){ printf("ls: %s: %s\n",path?path:".",ename(ENOENT)); return 1; }
     if(st.type==T_FILE){
-        if(longfmt) printf("file %8llu bytes  links=%u  %s\n",(unsigned long long)st.size,st.nlink,path);
-        else printf("%s\n",strrchr(path,'/')?strrchr(path,'/')+1:path);
+        if(longfmt) printf("file %8llu bytes  links=%u  %s\n",(unsigned long long)st.size,st.nlink,path?path:".");
+        else printf("%s\n",path?(strrchr(path,'/')?strrchr(path,'/')+1:path):".");
         return 0;
     }
     struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
@@ -97,7 +97,11 @@ static int cmd_ls(char *arg){
         if(!longfmt && (!strcmp(ents[i].name,".")||!strcmp(ents[i].name,".."))) continue;
         if(longfmt){
             struct fs_stat es;
-            fs_stat(&F,ents[i].ino,&es);
+            if(fs_stat(&F,ents[i].ino,&es)){
+                printf("??? %8s  links=%-3s %s%s [dangling]\n", "-", "-",
+                       ents[i].name, ents[i].type==T_DIR?"/":"");
+                continue;
+            }
             printf("%s %8llu  links=%-3u %s%s\n",
                    ents[i].type==T_DIR?"dir ":"file",
                    (unsigned long long)es.size, es.nlink,
@@ -282,6 +286,11 @@ int main(int argc, char **argv){
     IMG_PATH=img;
     int r=fs_mount(&F,img);
     if(r){ fprintf(stderr,"strata: cannot mount %s: %s\n",img,ename(-r)); return 1; }
+    { struct fs_stat rst;
+      if(fs_stat(&F,F.sb.root_ino,&rst) || rst.type!=T_DIR){
+        fprintf(stderr,"strata: root inode is not a directory - run fsck, image needs repair\n");
+        fs_unmount(&F); return 1;
+      } }
     CWD=F.sb.root_ino;
     char line[LINE];
     int interactive=isatty(0);

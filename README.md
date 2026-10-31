@@ -84,6 +84,10 @@ variable shadowed the caller's.
 - Single-indirect addressing only: files are capped at ~4.1 MiB.
 - No permissions enforcement (mode/uid/gid are stored, not checked),
   no symlinks, no sparse-file detection beyond zero-filling.
+- `fsck` refuses (FATAL, no repair attempted) when the root inode is not
+  a directory or the superblock geometry is corrupt: that image needs
+  manual repair, and the shell refuses to operate on it too. A missing
+  or unusable `/lost+found` on the other hand is recreated in place.
 - `fsck` does not attempt to recover orphaned *file contents* by
   scanning for data - orphaned inodes are reattached by inode number.
 - Not a kernel file system: no FUSE mount, this runs in userspace on

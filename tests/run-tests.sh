@@ -593,4 +593,153 @@ case "$out" in
   *) echo "FAIL: N8 [$out]"; fails=1;;
 esac
 
+
+echo "--- round-4 regressions ---"
+
+# F1: ls -l on a dangling entry must not print an uninitialized stat
+img=$T/r4f1.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a')
+d.seek(pb*BS+off); d.write(s.pack('<I',100))   # ino 100 is free
+d.close()
+R4PY
+out=$(printf 'ls -l /\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"[dangling]"*) echo "ok: ls -l flags a dangling entry";;
+  *) echo "FAIL: F1 [$out]"; fails=1;;
+esac
+
+# F2: duplicate names pointing at two live inodes: one --fix must converge
+# (was: dup removed but its inode left reachable, next fsck found an orphan)
+img=$T/r4f2.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /f aaa' 'write /g bbb' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'g')
+de=bytearray(e); de[8:8+2]=b'f\0'
+d.seek(pb*BS+off); d.write(bytes(de))
+d.close()
+R4PY
+$BIN fsck $img --fix >/dev/null 2>&1
+if $BIN fsck $img 2>&1 | grep -q clean; then echo "ok: duplicate-name fix converges in one run"
+else echo "FAIL: F2"; $BIN fsck $img 2>&1 | tail -3; fails=1; fi
+
+# F3: root inode flipped to a file: fsck must refuse loudly and the shell
+# must refuse to operate, never segfault in ls
+img=$T/r4f3.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+d.seek(g['it']*BS+g['root']*128); d.write(bytes([2,0]))   # T_FILE
+d.close()
+R4PY
+out=$($BIN fsck $img --fix 2>&1); rc=$?
+case "$out" in
+  *"FATAL: root inode is not a directory"*) [ $rc -ne 0 ] && echo "ok: fsck FATAL on non-dir root" || { echo "FAIL: F3 rc=0"; fails=1; };;
+  *) echo "FAIL: F3 [$out]"; fails=1;;
+esac
+out=$(printf 'ls\n' | $BIN shell $img 2>&1); rc=$?
+case "$out" in
+  *"root inode is not a directory"*) [ $rc -ne 0 ] && [ $rc -ne 139 ] && echo "ok: shell refuses a non-dir root (no segfault)" || { echo "FAIL: F3 shell rc=$rc"; fails=1; };;
+  *) echo "FAIL: F3 shell [$out]"; fails=1;;
+esac
+
+# F4a: superblock root_ino pointing at a live FILE inode is equally fatal
+img=$T/r4f4a.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+d.seek(52); d.write(s.pack('<I',aino))
+d.close()
+R4PY
+out=$($BIN fsck $img --fix 2>&1)
+case "$out" in
+  *"FATAL: root inode is not a directory"*) echo "ok: file-inode root_ino is FATAL";;
+  *) echo "FAIL: F4a [$out]"; fails=1;;
+esac
+out=$(printf 'ls\n' | $BIN shell $img 2>&1)
+case "$out" in
+  *"root inode is not a directory"*) echo "ok: shell refuses file-inode root";;
+  *) echo "FAIL: F4a shell [$out]"; fails=1;;
+esac
+
+# F4b: lnf_ino == root_ino must be recreated and converge in one --fix run,
+# keeping the root's real children
+img=$T/r4f4b.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+d.seek(56); d.write(s.pack('<I',g['root']))
+d.close()
+R4PY
+$BIN fsck $img --fix >/dev/null 2>&1
+if $BIN fsck $img 2>&1 | grep -q clean && printf 'ls /\n' | $BIN shell $img 2>/dev/null | grep -q '^a/$'; then
+  echo "ok: lnf==root repaired, converges, children intact"
+else echo "FAIL: F4b"; fails=1; fi
+
+# F4c: a dentry naming the root inode is an illegal directory hard link
+img=$T/r4f4c.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'mkdir /a' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a'); aino=s.unpack_from('<I',e,0)[0]
+d.seek(g['it']*BS+aino*128); ino=d.read(128)
+sz=s.unpack_from('<Q',ino,16)[0]; rb=s.unpack_from('<I',ino,36)[0]
+d.seek(rb*BS+2*128); d.write(s.pack('<I',g['root'])+bytes([1,0,0,0])+b'evil\0'+bytes(115))
+d.seek(g['it']*BS+aino*128+16); d.write(s.pack('<Q',sz+128))
+d.close()
+R4PY
+out=$($BIN fsck $img --fix 2>&1)
+case "$out" in
+  *"directory hard link removed"*) : ;;
+  *) echo "FAIL: F4c [$out]"; fails=1;;
+esac
+$BIN fsck $img 2>&1 | grep -q clean && echo "ok: dentry naming root removed, converges" || { echo "FAIL: F4c converge"; fails=1; }
+
+# F4d: an out-of-range lost+found pointer is recreated, not fatal
+img=$T/r4f4d.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b')
+d.seek(56); d.write(s.pack('<I',99999))
+d.close()
+R4PY
+$BIN fsck $img --fix >/dev/null 2>&1
+if $BIN fsck $img 2>&1 | grep -q clean && printf 'cat /a\n' | $BIN shell $img 2>/dev/null | grep -q '^data$'; then
+  echo "ok: out-of-range lnf pointer recreated, data intact"
+else echo "FAIL: F4d"; fails=1; fi
+
+# F6: a 120-byte unterminated dentry name must never over-read or hang
+img=$T/r4f6.img
+$BIN format $img 512 256 >/dev/null
+printf '%s\n' 'write /a data' 'sync' | $BIN shell $img >/dev/null 2>&1
+python3 - "$img" "$T/r3.py" <<'R4PY'
+import sys; exec(open(sys.argv[2]).read())
+d=open(sys.argv[1],'r+b'); g=geometry(d)
+pb,off,e=find(d,g,g['root'],'a')
+d.seek(pb*BS+off+8); d.write(b'A'*120)
+d.close()
+R4PY
+out=$(timeout 10 sh -c "printf 'ls\ndump\n' | $BIN shell $img 2>&1"); rc=$?
+[ $rc -ne 124 ] && [ $rc -ne 139 ] && echo "ok: unterminated name handled (rc=$rc)" || { echo "FAIL: F6 rc=$rc"; fails=1; }
+$BIN fsck $img --fix >/dev/null 2>&1
+$BIN fsck $img 2>&1 | grep -q clean && echo "ok: unterminated name repaired, converges" || { echo "FAIL: F6 fsck"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

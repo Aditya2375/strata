@@ -675,6 +675,7 @@ int fs_readdir(struct fs *f, uint32_t ino, struct dentry *out, uint32_t max, uin
         if(!pb) return -EFSCORRUPT;
         struct dentry *e=(struct dentry*)(blk(f,pb)+(off%STRATA_BS));
         if(e->ino==UINT32_MAX) continue;
+        if(e->name[STRATA_NAMEMAX]!=0) continue; /* unterminated hostile name: never let it over-read */
         out[n++]=*e;
     }
     /* if the caller's buffer filled, say whether entries were left out */
