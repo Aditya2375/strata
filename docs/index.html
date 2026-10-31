@@ -43,7 +43,7 @@
   </div>
   <p class="note">Commands: ls cd pwd mkdir touch write append cat rm rmdir ln mv stat df dump fsck sync (exit/crash end the session, so they are disabled here)</p>
 </main>
-<script src="strata.js?v=7"></script>
+<script src="strata.js?v=8"></script>
 <script>
 const out = document.getElementById('out');
 const inp = document.getElementById('in');
@@ -64,7 +64,7 @@ function seed(){
   for (const c of cmds) M.ccall('strata_exec', null, ['string'], [c]);
   print('strata ready - a small tree is seeded. Type a command, or click an example.');
 }
-StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=7'; } }).then(function(m){
+StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=8'; } }).then(function(m){
   M = m;
   const rc = M.ccall('strata_boot', 'number', [], []);
   if (rc) { out.textContent = 'boot failed (' + rc + ')'; return; }

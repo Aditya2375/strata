@@ -43,6 +43,21 @@ static const char *ename(int e){
     }
 }
 
+/* read a whole directory with no fixed entry cap: the buffer is sized
+   from the directory's own size, clamped to what the image could ever
+   hold, so a corrupt size field cannot cause a wild allocation */
+static struct dentry *read_all(struct fs *f, uint32_t ino, uint32_t *cnt){
+    struct dinode d; fs_iget(f,ino,&d);
+    if(d.type!=T_DIR || d.size%128) return NULL;
+    uint64_t maxn=d.size/128+2;
+    uint64_t absmax=(uint64_t)f->sb.nblocks*(STRATA_BS/128)+2;
+    if(maxn>absmax) maxn=absmax;
+    struct dentry *ents=malloc((size_t)maxn*sizeof *ents);
+    if(!ents) return NULL;
+    if(fs_readdir(f,ino,ents,(uint32_t)maxn,cnt,NULL)){ free(ents); return NULL; }
+    return ents;
+}
+
 static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
     /* reconstruct path by walking up via ".." */
     if(ino==f->sb.root_ino){ snprintf(out,cap,"/"); return; }
@@ -51,19 +66,23 @@ static void path_of(struct fs *f, uint32_t ino, char *out, size_t cap){
     while(cur!=f->sb.root_ino && n<64){
         struct dinode d; fs_iget(f,cur,&d);
         if(d.type!=T_DIR) break;
-        struct dentry ents[256]; uint32_t cnt=0;
-        if(fs_readdir(f,cur,ents,256,&cnt,NULL)) break;
+        uint32_t cnt=0;
+        struct dentry *ents=read_all(f,cur,&cnt);
+        if(!ents) break;
         uint32_t par=UINT32_MAX;
         for(uint32_t i=0;i<cnt;i++) if(!strcmp(ents[i].name,"..")) par=ents[i].ino;
+        free(ents);
         if(par==UINT32_MAX) break;
-        struct dentry pe[512]; uint32_t pc=0;
-        if(fs_readdir(f,par,pe,512,&pc,NULL)) break;
+        uint32_t pc=0;
+        struct dentry *pe=read_all(f,par,&pc);
+        if(!pe) break;
         int found=0;
         for(uint32_t i=0;i<pc;i++)
             if(pe[i].ino==cur && strcmp(pe[i].name,".") && strcmp(pe[i].name,"..")){
                 strncpy(parts[n],pe[i].name,STRATA_NAMEMAX); parts[n][STRATA_NAMEMAX]=0; n++;
                 found=1; break;
             }
+        free(pe);
         if(!found) break;
         cur=par;
     }
@@ -103,34 +122,27 @@ static void cwd_repair(void){
     CWD=F.sb.root_ino;
 }
 
-static int cmd_ls(char *arg){
-    int longfmt=0;
-    char *path=NULL;
-    if(arg){
-        char *save=NULL;
-        for(char *t=strtok_r(arg," \t",&save);t;t=strtok_r(NULL," \t",&save)){
-            if(!strcmp(t,"-l")) longfmt=1; else path=t;
-        }
-    }
+/* one operand of ls: resolve and list it. header!=0 prints "name:" first */
+static int ls_one(const char *path,int longfmt,int header){
     uint32_t ino;
-    int r=path?fs_resolve(&F,CWD,path,&ino):0;
-    if(!path) ino=CWD;
+    int r=fs_resolve(&F,CWD,path,&ino);
     if(r){ printf("ls: %s: %s\n",path,ename(-r)); return 1; }
     struct fs_stat st;
-    if(fs_stat(&F,ino,&st)){ printf("ls: %s: %s\n",path?path:".",ename(ENOENT)); return 1; }
+    if(fs_stat(&F,ino,&st)){ printf("ls: %s: %s\n",path,ename(ENOENT)); return 1; }
     if(st.type==T_FILE){
-        if(longfmt) printf("file %8llu bytes  links=%u  %s\n",(unsigned long long)st.size,st.nlink,path?path:".");
+        if(longfmt) printf("file %8llu bytes  links=%u  %s\n",(unsigned long long)st.size,st.nlink,path);
         else{
-            /* "ls file/" would otherwise print an empty name */
+            /* print just the base name, as GNU ls does for a file operand */
             size_t pl=strlen(path); while(pl>1 && path[pl-1]=='/') pl--;
             const char *base=path+pl; while(base>path && base[-1]!='/') base--;
             printf("%.*s\n",(int)(path+pl-base),base);
         }
         return 0;
     }
+    if(header) printf("%s:\n",path);   /* headers mark directory operands only */
     struct dentry *ents=malloc(sizeof(struct dentry)*4096); uint32_t cnt; int trunc=0;
     int rr=fs_readdir(&F,ino,ents,4096,&cnt,&trunc);
-    if(rr){ free(ents); printf("ls: %s: %s\n",path?path:".",ename(-rr)); return 1; }
+    if(rr){ free(ents); printf("ls: %s: %s\n",path,ename(-rr)); return 1; }
     if(trunc) printf("ls: (listing truncated at %u entries)\n",cnt);
     /* sort by name for stable output */
     for(uint32_t i=1;i<cnt;i++){
@@ -155,6 +167,29 @@ static int cmd_ls(char *arg){
     }
     free(ents);
     return 0;
+}
+
+/* ls [-l] [p ...]: each operand is listed, GNU style - files by name,
+   directories under a "name:" header when there is more than one */
+static int cmd_ls(char *arg){
+    int longfmt=0;
+    char *ops[64]; int nops=0;
+    if(arg){
+        char *save=NULL;
+        for(char *t=strtok_r(arg," \t",&save);t;t=strtok_r(NULL," \t",&save)){
+            if(!strcmp(t,"-l")) longfmt=1;
+            else if(nops<64) ops[nops++]=t;
+            else { printf("ls: too many operands\n"); return 1; }
+        }
+    }
+    if(!nops) return ls_one(".",longfmt,0);
+    int rc=0;
+    for(int i=0;i<nops;i++){
+        int r=ls_one(ops[i],longfmt,nops>1);
+        if(r) rc=1;   /* a bad operand does not stop the rest (GNU behavior) */
+        if(i+1<nops) printf("\n");
+    }
+    return rc;
 }
 
 static int one_cmd(char *line){

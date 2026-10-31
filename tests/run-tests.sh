@@ -1255,4 +1255,32 @@ printf 'cat /lg\n' | $BIN shell $img 2>&1 | grep -q 'yyyy' && \
 ! grep -q 'line too long' $T/r11max.out && \
 echo "ok: longest legal line still accepted" || { echo "FAIL: R11-maxline [$(cat $T/r11max.out)]"; fails=1; }
 
+echo "--- polish: pwd works in a directory whose parent has 510+ entries ---"
+img=$T/r12pw.img
+$BIN format $img 4096 1024 >/dev/null
+python3 - "$BIN" "$img" <<'PY'
+import subprocess, sys
+binp, img = sys.argv[1:3]
+cmds = ["mkdir /big"] + ["touch /big/f%d" % i for i in range(520)] +        ["mkdir /big/sub", "cd /big/sub", "pwd"]
+out = subprocess.run([binp, "shell", img], input="\n".join(cmds) + "\n",
+                     text=True, capture_output=True).stdout
+lines = [l for l in out.splitlines() if l.startswith("/")]
+assert lines and lines[-1] == "/big/sub", out[-300:]
+print("ok: pwd with a 520-entry parent directory")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+echo "--- polish: ls takes multiple operands, GNU style ---"
+img=$T/r12ls.img
+$BIN format $img >/dev/null
+out=$(printf 'mkdir /d\nwrite /d/a 1\nwrite /f hi\nls /f /d\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q '^f$' && \
+printf '%s\n' "$out" | grep -q '^/d:$' && \
+printf '%s\n' "$out" | grep -q '^a$' && \
+echo "ok: ls lists every operand, dir operands under a header" || { echo "FAIL: R12-ls [$out]"; fails=1; }
+out=$(printf 'ls /d /nope /f\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'ls: /nope: no such file or directory' && \
+printf '%s\n' "$out" | grep -q '^f$' && \
+echo "ok: a bad ls operand does not stop the rest" || { echo "FAIL: R12-lserr [$out]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi

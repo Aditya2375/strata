@@ -27,6 +27,11 @@ timestamps, 12 direct block pointers + 1 single-indirect pointer
 
 - Files: create, read, write, append, truncate (with block freeing)
 - Directories: mkdir, rmdir, nested paths, `ls`, `cd`, `pwd`
+  (`ls` takes multiple operands GNU-style: file operands print their
+  base name, directory operands list under a `name:` header with a
+  blank line between listings, and a bad operand errors without
+  stopping the rest; `pwd` reconstructs any depth and any directory
+  size, showing an elided `/.../tail` past 64 components)
 - Hard links (shared inode, link counts), rename (incl. across
   directories, POSIX edge cases: self-rename is a no-op, renaming a
   directory into its own subtree is rejected, rename onto hard links
