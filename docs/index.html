@@ -13,7 +13,7 @@
   a { color:#58a6ff; }
   .term { background:#010409; border:1px solid #30363d; border-radius:8px; margin-top:1rem; }
   .termbar { padding:.4rem .8rem; color:#8b949e; font:12px ui-monospace,monospace; border-bottom:1px solid #30363d; }
-  #out { height:340px; overflow-y:auto; padding:.8rem; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; color:#7ee787; }
+  #out { height:340px; overflow-y:auto; overflow-wrap:anywhere; padding:.8rem; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; color:#7ee787; }
   #out .cmd { color:#58a6ff; }
   #in { width:100%; box-sizing:border-box; background:transparent; border:0; border-top:1px solid #30363d; color:#c9d1d9; padding:.6rem .8rem; font:13px ui-monospace,monospace; outline:none; }
   .btns { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:1rem; }
@@ -43,7 +43,7 @@
   </div>
   <p class="note">Commands: ls cd pwd mkdir touch write append cat rm rmdir ln mv stat df dump fsck sync (exit/crash end the session, so they are disabled here)</p>
 </main>
-<script src="strata.js?v=3"></script>
+<script src="strata.js?v=4"></script>
 <script>
 const out = document.getElementById('out');
 const inp = document.getElementById('in');
@@ -64,7 +64,7 @@ function seed(){
   for (const c of cmds) M.ccall('strata_exec', null, ['string'], [c]);
   print('strata ready - a small tree is seeded. Type a command, or click an example.');
 }
-StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=3'; } }).then(function(m){
+StrataModule({ print: print, printErr: function(){}, locateFile: function(f){ return f + '?v=4'; } }).then(function(m){
   M = m;
   const rc = M.ccall('strata_boot', 'number', [], []);
   if (rc) { out.textContent = 'boot failed (' + rc + ')'; return; }

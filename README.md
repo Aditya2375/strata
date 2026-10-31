@@ -18,7 +18,7 @@ block 1..        inode bitmap | data block bitmap | inode table | data blocks
 
 4096-byte blocks. 128-byte inodes: type, mode, owner, link count, size,
 timestamps, 12 direct block pointers + 1 single-indirect pointer
-(max file ~4.1 MiB). Directories are files of 128-byte entries.
+(max file 4.05 MiB, 4,243,456 B). Directories are files of 128-byte entries.
 `mkfs` creates the root directory and `/lost+found`.
 
 ## Features
@@ -81,7 +81,7 @@ variable shadowed the caller's.
   `sync` flushes dirty blocks. Images are meant to be megabytes, not
   gigabytes, and anything past 1 GiB (256K blocks) is refused at mount
   rather than allowed to exhaust memory.
-- Single-indirect addressing only: files are capped at ~4.1 MiB.
+- Single-indirect addressing only: files are capped at 4.05 MiB (4,243,456 B).
 - No permissions enforcement (mode/uid/gid are stored, not checked),
   no symlinks, no sparse-file detection beyond zero-filling.
 - `fsck` refuses (FATAL, no repair attempted) when the root inode is not

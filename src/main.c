@@ -226,7 +226,7 @@ static int one_cmd(char *line){
     }
     if(!strcmp(cmd,"write")||!strcmp(cmd,"append")){
         if(!rest){ printf("%s: missing operand\n",cmd); return 1; }
-        char *sp=strchr(rest,' ');
+        char *sp=strpbrk(rest," \t");
         if(!sp){ printf("%s: usage: %s FILE TEXT\n",cmd,cmd); return 1; }
         *sp=0; char *text=sp+1;
         char *nl=strchr(text,'\n'); if(nl) *nl=0;
@@ -243,9 +243,9 @@ static int one_cmd(char *line){
     }
     if(!strcmp(cmd,"ln")||!strcmp(cmd,"mv")){
         if(!rest){ printf("%s: missing operands\n",cmd); return 1; }
-        char *sp=strchr(rest,' ');
+        char *sp=strpbrk(rest," \t");
         if(!sp){ printf("%s: usage: %s A B\n",cmd,cmd); return 1; }
-        *sp=0; char *b=sp+1; while(*b==' ') b++;
+        *sp=0; char *b=sp+1; while(*b==' '||*b=='\t') b++;
         char *nl=strchr(b,'\n'); if(nl) *nl=0;
         int r = !strcmp(cmd,"ln") ? fs_link(&F,CWD,rest,b) : fs_rename(&F,CWD,rest,b);
         if(r) printf("%s: %s\n",cmd,ename(-r));

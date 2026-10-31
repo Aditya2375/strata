@@ -398,7 +398,10 @@ int fs_create(struct fs *f, uint32_t cwd, const char *path, uint16_t type, uint3
     int r=namei(f,cwd,path,NULL,last,&par);
     if(r==0) return -EEXIST;
     if(r!=-ENOENT) return r;
-    if(!last[0]||par==UINT32_MAX) return last[0]?-ENOENT:-EEXIST;
+    /* namei leaves par at UINT32_MAX when an intermediate component is
+       missing (last stays empty from namei's entry zeroing): that path is
+       "no such file or directory", never "already exists" */
+    if(par==UINT32_MAX||!last[0]) return -ENOENT;
     struct dinode pd; fs_iget(f,par,&pd);
     if(pd.type!=T_DIR) return -ENOTDIR;
     uint32_t ino=ialloc(f,type);
@@ -523,7 +526,11 @@ int fs_unlink(struct fs *f, uint32_t cwd, const char *path){
 int fs_rmdir(struct fs *f, uint32_t cwd, const char *path){
     char last[STRATA_NAMEMAX+1]; uint32_t par;
     int r=namei(f,cwd,path,NULL,last,&par);
-    if(r||!last[0]||par==UINT32_MAX) return r?r:-ENOENT;
+    if(r) return r;
+    /* "/" (or a lone "."/".."): namei resolves it but there is no final
+       component to remove - POSIX says the root is busy */
+    if(!last[0]) return -EBUSY;
+    if(par==UINT32_MAX) return -ENOENT;
     struct dinode pd; fs_iget(f,par,&pd);
     struct dentry de;
     r=dir_scan(f,&pd,par,last,NULL,&de);

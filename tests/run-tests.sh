@@ -995,4 +995,32 @@ echo "--- R7: format prints the real inode count ---"
 out=$($BIN format $T/r7fmt.img 512 100 2>&1)
 printf '%s\n' "$out" | grep -q '128 inodes' && echo "ok: format reports rounded inode count" || { echo "FAIL: R7 format [$out]"; fails=1; }
 
+echo "--- R8: missing intermediate components are ENOENT ---"
+img=$T/r8.img
+$BIN format $img 256 128 >/dev/null
+out=$(printf 'mkdir /nope/x\ntouch /d2/f\ntouch /real\nln /real /nope/b\nmv /real /nope/c\nls /\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'mkdir: /nope/x: no such file or directory' && \
+printf '%s\n' "$out" | grep -q 'touch: /d2/f: no such file or directory' && \
+printf '%s\n' "$out" | grep -q 'ln: no such file or directory' && \
+printf '%s\n' "$out" | grep -q 'mv: no such file or directory' && \
+printf '%s\n' "$out" | grep -q '^real$' && \
+! printf '%s\n' "$out" | grep -q '^d2$' && \
+echo "ok: missing parents are ENOENT everywhere" || { echo "FAIL: R8-MED [$out]"; fails=1; }
+
+echo "--- R8: tab is whitespace in every command ---"
+img=$T/r8tab.img
+$BIN format $img 256 128 >/dev/null
+out=$(printf 'write /t\thello-tab\ncat /t\nln /t\t/t2\nmv /t2\t/t3\nstat /t3\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q '^hello-tab$' && \
+printf '%s\n' "$out" | grep -q 'links=2' && \
+echo "ok: tabs separate args in write/ln/mv" || { echo "FAIL: R8-tab [$out]"; fails=1; }
+
+echo "--- R8: rmdir / is EBUSY ---"
+img=$T/r8rmdir.img
+$BIN format $img 256 128 >/dev/null
+out=$(printf 'rmdir /\nrmdir /nope\n' | $BIN shell $img 2>&1)
+printf '%s\n' "$out" | grep -q 'rmdir: /: device or resource busy' && \
+printf '%s\n' "$out" | grep -q 'rmdir: /nope: no such file or directory' && \
+echo "ok: rmdir / is busy, rmdir missing is ENOENT" || { echo "FAIL: R8-rmdir [$out]"; fails=1; }
+
 if [ $fails -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "FAILURES PRESENT"; exit 1; fi
